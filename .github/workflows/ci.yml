@@ -4,12 +4,27 @@ name: ci
 #
 #   * `host` builds and tests the two crates that have no hardware in them --
 #     pycon (the language) and badgy-fat (the filesystem). They hold most of the
-#     logic and all of the parsing of untrusted input, and they need no badge, no
-#     riscv toolchain and no xous-core checkout. They are what actually gates a
-#     merge.
-#   * `firmware` proves the image still links and signs, which needs the pinned
-#     xous-core and a riscv target. It cannot check that the firmware *works* --
-#     that takes a badge and a pair of eyes.
+#     logic and all of the parsing of untrusted input, and they need no badge and
+#     no riscv toolchain. They are what actually gates a merge.
+#   * `firmware` proves the image still links and signs, which needs a riscv
+#     target. It cannot check that the firmware *works* -- that takes a badge and
+#     a pair of eyes.
+#
+# Both halves bootstrap vendor/xous-core, and the host half wishes it did not.
+# Nothing it compiles refers to that tree -- but `pycon` and `badgy-fat` are
+# members of this workspace, and cargo loads *every* member's manifest before it
+# will do anything at all, including the root `badgyos` package whose path
+# dependencies point into vendor/xous-core. So `cargo test -p pycon` fails at
+# manifest resolution, before a single crate is compiled, if the checkout is
+# missing:
+#
+#     error: failed to load manifest for workspace member `.`
+#     Caused by: failed to load manifest for dependency `bao1x-api`
+#
+# The alternative is to take the two crates out of the workspace so they resolve
+# alone, which costs a second lockfile and breaks `cargo test -p pycon` from the
+# root -- the command the Cargo.toml comment tells contributors to use. A cached
+# blobless clone is cheaper than that.
 
 on:
   push:
@@ -45,6 +60,27 @@ jobs:
       # make sure CI is running the full set.
       - name: Install dosfstools and mtools
         run: sudo apt-get update && sudo apt-get install -y dosfstools mtools
+
+      # Only so that cargo will look at this workspace at all -- see the note at
+      # the top of this file. Nothing below compiles a line of it.
+      - name: Read the xous-core pin
+        id: pin
+        run: |
+          sed -n 's/^[[:space:]]*url[[:space:]]*=[[:space:]]*//p'    xous-core.pin | head -1 | sed 's/^/url=/'    >> "$GITHUB_OUTPUT"
+          sed -n 's/^[[:space:]]*commit[[:space:]]*=[[:space:]]*//p' xous-core.pin | head -1 | sed 's/^/commit=/' >> "$GITHUB_OUTPUT"
+
+      - name: Cache the pinned xous-core checkout
+        id: vendor-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/xous-core
+          key: xous-core-${{ steps.pin.outputs.commit }}
+
+      - name: Bootstrap vendor/xous-core
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        # XOUS_CORE is cleared so bootstrap.sh cannot adopt some other checkout
+        # and quietly build against the wrong commit.
+        run: XOUS_CORE= ./bootstrap.sh
 
       - uses: Swatinem/rust-cache@v2
         with:
