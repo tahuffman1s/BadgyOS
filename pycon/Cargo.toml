@@ -1,0 +1,22 @@
+[package]
+name = "pycon"
+version = "0.1.0"
+edition = "2021"
+# Apache-2.0, matching xous-core: gfx.rs, the font, platform.rs, link.x and
+# build.rs are derived from that tree.
+license = "Apache-2.0"
+description = "pycon: a Python-subset language for BadgyOS. no_std, alloc-only, zero dependencies, no hardware."
+
+# Deliberately dependency-free. The point of this crate being separate from the
+# firmware is that it can be compiled and unit-tested for the host:
+#
+#     cargo test -p pycon --target x86_64-unknown-linux-gnu
+#
+# Anything that touches the badge lives behind the `Host` trait, which the
+# firmware implements and the tests fake.
+[dependencies]
+
+[features]
+# Pulls in `std` for the test harness only. The firmware never enables it.
+std = []
+default = []

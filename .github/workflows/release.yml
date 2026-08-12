@@ -1,0 +1,121 @@
+name: release
+
+# Tag a version and get a flashable badgyos.uf2 attached to a GitHub release,
+# built from the pinned xous-core rather than from whatever a laptop had lying
+# around.
+#
+#     git tag -a v0.1.0 -m "..." && git push origin v0.1.0
+#
+# The release notes carry the developer-key warning verbatim, because the one
+# thing a stranger downloading this needs to know is that flashing it costs them
+# their badge's k0 permanently. Anyone can produce a valid signature -- the
+# developer private key is published in xous-core -- so a signed artifact here is
+# not a claim of provenance, and the notes say so.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Read the xous-core pin
+        id: pin
+        run: |
+          sed -n 's/^[[:space:]]*commit[[:space:]]*=[[:space:]]*//p' xous-core.pin | head -1 | sed 's/^/commit=/' >> "$GITHUB_OUTPUT"
+
+      - name: Cache the pinned xous-core checkout
+        id: vendor-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/xous-core
+          key: xous-core-${{ steps.pin.outputs.commit }}
+
+      - name: Bootstrap vendor/xous-core
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        run: XOUS_CORE= ./bootstrap.sh
+
+      - name: Install the riscv toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add riscv32imac-unknown-none-elf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          workspaces: |
+            .
+            vendor/xous-core
+
+      - name: Build, package and sign
+        run: ./build.sh
+
+      - name: Validate and record what is in the image
+        id: image
+        run: |
+          out=target/riscv32imac-unknown-none-elf/release
+          ./tools/badgeflash.py --dry-run "$out/badgyos.uf2" | tee /tmp/validate.txt
+          {
+            echo 'report<<EOF'
+            sed 's/^/    /' /tmp/validate.txt
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          sha256sum "$out/badgyos.uf2" > "$out/badgyos.uf2.sha256"
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/riscv32imac-unknown-none-elf/release/badgyos.uf2
+            target/riscv32imac-unknown-none-elf/release/badgyos.uf2.sha256
+          generate_release_notes: true
+          body: |
+            ## Flashing this is irreversible
+
+            `badgyos.uf2` is signed with xous-core's **developer** key, whose
+            private half is published. When boot1 validates a developer-signed
+            image it erases the badge's secrets and increments the
+            `DEVELOPER_MODE` one-way counter:
+
+            * **`k0`, the DEF CON light-encryption key, is destroyed** and cannot
+              be recovered. Reflashing the stock firmware does not bring it back.
+              The badge is out of the conference light-breeding game for good.
+            * The badge is permanently marked as a developer device.
+
+            Restoring stock still works (anti-rollback counters are per function
+            code), but a restored badge is still a flagged one. See the README
+            before you plug anything in.
+
+            Because the signing key is public, this signature says nothing about
+            who built the file. Verify the checksum against this run, or build it
+            yourself -- `./bootstrap.sh && ./build.sh` is the whole recipe.
+
+            ## Image
+
+            ```
+            ${{ steps.image.outputs.report }}
+            ```
+
+            Built against xous-core `${{ steps.pin.outputs.commit }}`.
+
+            ## Install
+
+            1. Hold any button while plugging the badge in, to enter boot1's
+               update mode. A volume called `BAOCHIP` appears.
+            2. `./tools/badgeflash.py badgyos.uf2`, or copy the file across by
+               hand and `sync`.
+            3. Press any button to commit and boot.

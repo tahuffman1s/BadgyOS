@@ -1,0 +1,13 @@
+# The xous-core commit BadgyOS is built against.
+#
+# BadgyOS links the Baochip board-support crates (bao1x-hal, bao1x-api, ux-api,
+# utralib, svd2utra) straight out of the Xous tree, and calls its host tools
+# (xous-copy-object, xous-sign-image) to package the image. None of that is
+# published to crates.io in a form that carries the bao1x register definitions,
+# so the dependency is a pinned checkout rather than a version number.
+#
+# `./bootstrap.sh` reads this file. Bump it deliberately: these crates are the
+# hardware contract, and two of the bugs BadgyOS routes around live in them
+# (see README, "Two things upstream does that this deliberately does not").
+url  = https://github.com/betrusted-io/xous-core
+commit = 5d5bbbfa95c0dcef26fe1fe9b496b7f6f31d191b

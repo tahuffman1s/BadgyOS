@@ -1,0 +1,160 @@
+name: ci
+
+# Two halves, and the split is the point:
+#
+#   * `host` builds and tests the two crates that have no hardware in them --
+#     pycon (the language) and badgy-fat (the filesystem). They hold most of the
+#     logic and all of the parsing of untrusted input, and they need no badge, no
+#     riscv toolchain and no xous-core checkout. They are what actually gates a
+#     merge.
+#   * `firmware` proves the image still links and signs, which needs the pinned
+#     xous-core and a riscv target. It cannot check that the firmware *works* --
+#     that takes a badge and a pair of eyes.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a test failure is worth more than the noise costs.
+  RUST_BACKTRACE: 1
+
+jobs:
+  host:
+    name: host tests (pycon + badgy-fat)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchains
+        # Nightly is only for rustfmt: rustfmt.toml uses unstable options, which
+        # is what keeps this tree's layout matching xous-core's. The code itself
+        # builds and tests on stable.
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          rustup default stable
+
+      # badgy-fat's tests shell out to real tools rather than trusting this
+      # parser against its own formatter: mkfs.fat builds volumes, fsck.fat
+      # judges the ones we build, and mtools writes files with long names. Three
+      # tests skip themselves when mtools is absent, so it is installed here to
+      # make sure CI is running the full set.
+      - name: Install dosfstools and mtools
+        run: sudo apt-get update && sudo apt-get install -y dosfstools mtools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: host
+
+      # `--target` is explicit because .cargo/config.toml pins the riscv target
+      # for this workspace, and these two crates are being tested for the host.
+      - name: Test
+        run: |
+          cargo test --target x86_64-unknown-linux-gnu \
+            -p pycon -p badgy-fat --features std
+
+      - name: Check they are still no_std-clean
+        # The firmware links them without `std`; a test-only `std` dependency
+        # that creeps in would only fail in the firmware job, and only after a
+        # ten-minute riscv build. This catches it in seconds.
+        run: |
+          cargo build --target x86_64-unknown-linux-gnu -p pycon -p badgy-fat
+
+      - name: Format
+        # Named packages rather than `--all`: the path dependencies into
+        # vendor/xous-core are visible to `cargo fmt --all`, and pointing rustfmt
+        # at that tree both reformats code we do not own and trips over a
+        # `macro_rules!` in its locales crate.
+        run: cargo +nightly fmt -p badgyos -p pycon -p badgy-fat --check
+
+      - name: Clippy
+        run: |
+          cargo clippy --target x86_64-unknown-linux-gnu \
+            -p pycon -p badgy-fat --features std --all-targets -- -D warnings
+
+  sprites:
+    name: sprites are in sync with the generator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # src/sprites.rs is generated art that is committed and hand-editable. That
+      # is a deliberate trade, and this job is the tripwire for the half of it
+      # that goes wrong quietly: a change to tools/badger.py that nobody ran.
+      # A hand edit is fine and expected -- it just has to be ported back into
+      # the generator, which is exactly what this asks for.
+      - name: Re-emit and diff
+        run: |
+          ./tools/badger.py emit
+          if ! git diff --exit-code -- src/sprites.rs; then
+            echo "::error::src/sprites.rs differs from tools/badger.py output."
+            echo "Run ./tools/badger.py emit and commit, or port the hand edit"
+            echo "back into the generator."
+            exit 1
+          fi
+
+  firmware:
+    name: firmware image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the xous-core pin
+        id: pin
+        run: |
+          sed -n 's/^[[:space:]]*url[[:space:]]*=[[:space:]]*//p'    xous-core.pin | head -1 | sed 's/^/url=/'    >> "$GITHUB_OUTPUT"
+          sed -n 's/^[[:space:]]*commit[[:space:]]*=[[:space:]]*//p' xous-core.pin | head -1 | sed 's/^/commit=/' >> "$GITHUB_OUTPUT"
+
+      # Keyed on the commit, so this is a cache hit until the pin moves.
+      - name: Cache the pinned xous-core checkout
+        id: vendor-cache
+        uses: actions/cache@v4
+        with:
+          path: vendor/xous-core
+          key: xous-core-${{ steps.pin.outputs.commit }}
+
+      - name: Bootstrap vendor/xous-core
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        # XOUS_CORE is cleared so bootstrap.sh cannot adopt some other checkout
+        # and quietly build against the wrong commit.
+        run: XOUS_CORE= ./bootstrap.sh
+
+      - name: Install the riscv toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add riscv32imac-unknown-none-elf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: firmware
+          # The host tools (xous-copy-object, xous-sign-image) are built inside
+          # the vendored workspace, so its target dir is worth caching too.
+          workspaces: |
+            .
+            vendor/xous-core
+
+      # build.sh does the whole pipeline: cargo build -> copy-object -> sign,
+      # and prints the poke-table and heap/stack numbers that only fail at boot.
+      - name: Build, package and sign
+        run: ./build.sh
+
+      - name: Validate the image the way boot1 will
+        # The flasher's dry run is the same check boot1's UF2 receiver applies,
+        # except that boot1 does it silently: a block with the wrong family ID or
+        # an out-of-window target is dropped without an error, and the first sign
+        # of trouble is a badge that fails its signature check on next boot.
+        run: |
+          ./tools/badgeflash.py --dry-run \
+            target/riscv32imac-unknown-none-elf/release/badgyos.uf2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: badgyos-uf2
+          path: |
+            target/riscv32imac-unknown-none-elf/release/badgyos.uf2
+            target/riscv32imac-unknown-none-elf/release/badgyos.img
+          if-no-files-found: error

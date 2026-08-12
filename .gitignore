@@ -1,0 +1,38 @@
+# Rust / cargo build output. `target/` here is ~1 GiB once the riscv32 and host
+# toolchains have both had a go at it.
+/target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# The pinned xous-core checkout. Not ours, used read-only, and either a symlink
+# to a clone you already have or a multi-gigabyte shallow clone -- either way it
+# is reproducible from xous-core.pin via ./bootstrap.sh.
+/vendor/
+
+# Build artifacts of the image pipeline that land outside target/ if you run the
+# steps by hand.
+*.uf2
+*.img
+!samples/**/*.img
+
+# Sprite previews. `tools/badger.py preview|screen` renders Badgy to PNG so the
+# art can be looked at instead of imagined. Scratch: the .rs is the source, and
+# the two PNGs the README shows are written to docs/ and committed.
+/preview/
+
+# Compiler crash dumps. `cargo fmt --all` drops one of these here when rustfmt
+# follows the path dependencies into vendor/xous-core and hits a macro it cannot
+# reparse -- which is why CI names packages instead.
+rustc-ice-*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

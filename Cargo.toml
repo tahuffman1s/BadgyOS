@@ -1,0 +1,79 @@
+# BadgyOS is its own workspace. The Xous board-support crates it links against
+# are not published in a usable form, so they come in as path dependencies into
+# `vendor/xous-core` -- a pinned checkout that `./bootstrap.sh` creates, either
+# as a symlink to a clone you already have or as a shallow clone of the commit
+# in `xous-core.pin`. That directory is gitignored: it is upstream's code, used
+# read-only, and nothing here ever writes to it.
+#
+# `pycon` is a member rather than an inline module because it has no
+# hardware dependencies at all, which means it compiles and unit-tests for the
+# host:
+#
+#     cargo test -p pycon --features std --target x86_64-unknown-linux-gnu
+#
+# That is the only part of this firmware that can be tested without a badge, so
+# it is worth the extra manifest.
+[workspace]
+members = [".", "pycon", "badgy-fat"]
+
+[package]
+name = "badgyos"
+version = "0.1.0"
+edition = "2021"
+# Apache-2.0, matching xous-core: gfx.rs, the font, platform.rs, link.x and
+# build.rs are derived from that tree.
+license = "Apache-2.0"
+description = "BadgyOS: a scriptable baremetal firmware for the DEF CON 34 badge -- pycon interpreter, USB script drive, and a badger."
+
+[dependencies]
+# The two crates that carry the interesting logic. Both are hardware-free and
+# `no_std`, which is what lets them be unit-tested on the host -- see the
+# workspace comment above.
+pycon = { path = "pycon" }
+badgy-fat = { path = "badgy-fat" }
+
+# Xous is here only for its error type, which the bao1x-hal display driver returns.
+xous = "0.9.70"
+utralib = { version = "0.1.27", default-features = false, features = ["bao1x"] }
+bao1x-api = { path = "vendor/xous-core/libs/bao1x-api", default-features = false }
+# `loader-baosec` is the no-std flavor of the baosec board support: SH1107 OLED
+# driver + pin maps, without the Xous-service (`std`) machinery.
+# `security` is not optional in practice -- clocks.rs and rram.rs reference the
+# hardening/sigcheck modules unconditionally, so the crate does not compile without it.
+bao1x-hal = { path = "vendor/xous-core/libs/bao1x-hal", default-features = false, features = [
+    "loader-baosec",
+    "security",
+] }
+ux-api = { path = "vendor/xous-core/libs/ux-api", default-features = false, features = [
+    "loader-baosec",
+] }
+riscv = { version = "0.14.0", features = ["critical-section-single-hart"] }
+critical-section = "1.2.0"
+
+# bao1x-hal's SPIM/OLED paths expect a global allocator to exist. Nothing in this
+# firmware allocates at runtime, but the heap has to be present to link.
+linked_list_allocator = "0.10.5"
+
+[features]
+# The DC34 badge is a "lite" baosec. This is NOT cosmetic: it moves the
+# peripheral reset line from PC6 (active low) to PA6 (active high), and
+# `Oled128x128::new()` drives that line. Building without it on a badge
+# configures the wrong pin and the panel stays dark.
+# Turn it off only if you are targeting a full baosec devkit.
+baosec-lite = ["bao1x-hal/oem-baosec-lite"]
+default = ["baosec-lite"]
+
+# Mirrors the patches xous-core applies for these two machine-generated crates.
+# Without them cargo would pull the crates.io copies, which do not carry the
+# bao1x register definitions.
+[patch.crates-io]
+utralib = { path = "vendor/xous-core/utralib" }
+svd2utra = { path = "vendor/xous-core/svd2utra" }
+
+[profile.release]
+codegen-units = 1
+debug = false
+strip = false
+lto = "fat"
+incremental = true
+opt-level = "s"

@@ -1,0 +1,39 @@
+# Adopted from xous-core's rustfmt.toml, because this firmware is read side by
+# side with that tree -- `src/gfx.rs` is vendored from boot1, `src/platform.rs`
+# and `link.x` are adapted from `baremetal/`, and half the comments here point at
+# a file over there. Matching its layout means a diff between the two is about
+# behaviour rather than about line breaks.
+#
+# Several of these are nightly-only (`unstable_features`), so formatting needs
+# nightly rustfmt even though the firmware itself builds on stable:
+#
+#     cargo +nightly fmt --all
+#
+# CI runs `--check` with nightly for the same reason.
+
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+# Long lines beat wrapped register names and hex windows.
+max_width = 110
+use_small_heuristics = "Max"
+
+unstable_features = true
+style_edition = "2024"
+comment_width = 110
+group_imports = "StdExternalCrate"
+normalize_doc_attributes = true
+format_code_in_doc_comments = true
+format_macro_bodies = true
+format_macro_matchers = true
+format_strings = false
+wrap_comments = true
+fn_single_line = true
+reorder_impl_items = true
+reorder_imports = true
+reorder_modules = true
+
+# src/sprites.rs is generated art: 8 sprites x 74 string rows. rustfmt would
+# reflow the rows into something no longer readable as a picture, and the point
+# of committing the art as text is that you can read it.
+ignore = ["src/sprites.rs"]

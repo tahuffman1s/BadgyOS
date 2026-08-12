@@ -1,0 +1,18 @@
+[package]
+name = "badgy-fat"
+version = "0.1.0"
+edition = "2021"
+# Apache-2.0, matching xous-core: gfx.rs, the font, platform.rs, link.x and
+# build.rs are derived from that tree.
+license = "Apache-2.0"
+description = "badgy-fat: just enough FAT12/16 for a USB host to drop files on BadgyOS and have the badge read them back."
+
+# No dependencies, and no hardware: a volume is a `&[u8]`. That means the tests
+# can build a volume with the real `mkfs.fat`, mount it, drop a file on it with
+# `cp`, and check this parser against what a genuine host actually wrote --
+# which is the only way to be sure about a format this crusty.
+[dependencies]
+
+[features]
+std = []
+default = []
