@@ -109,6 +109,14 @@ documents itself.
 Scripts survive a power cycle: the whole volume is mirrored into on-chip ReRAM
 whenever it goes quiet.
 
+**They also survive a firmware update, which cuts both ways.** `Scripts::init`
+restores the saved volume whenever there is one and only seeds the samples when
+it has to format, so flashing a build with a newer `hello.py` on a badge that
+already has a drive leaves the old one in place — correctly, because by then it
+may be a file you edited. To pick up a changed sample, copy it onto the drive
+from `samples/`, or reformat from the **USB Drive** screen (hold the wheel for
+two seconds), which erases everything and re-seeds.
+
 **Hold LEFT + CENTER to stop a running script.** Two keys, because single keys
 belong to the script — `keys()` is part of the API.
 

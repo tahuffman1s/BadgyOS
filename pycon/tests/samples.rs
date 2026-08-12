@@ -332,6 +332,14 @@ fn jiggle_py_sends_nothing_with_no_host() {
     assert_eq!(script.run(&mut host).unwrap(), Completion::Aborted);
     assert_eq!(host.reports, 0);
     assert!(host.ticks > 100, "jiggle.py should keep running unplugged, saw {} ticks", host.ticks);
+
+    // And it should still be holding the mascot. The home screen is what you
+    // look at with the badge on a table, which is often the moment the cable is
+    // out -- a jiggler that dropped the mouse whenever nothing was listening
+    // would be invisible exactly when you went to look at it.
+    let base = pycon::host::SPRITE_SLOT_BASE;
+    assert_eq!(host.held, (base, base), "unplugged, he should hold one frame rather than wave it");
+    assert_eq!(host.caption, "no host");
 }
 
 #[test]

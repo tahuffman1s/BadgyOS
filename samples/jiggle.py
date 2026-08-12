@@ -3,9 +3,9 @@
 # work four ways: the cursor traces a small square and returns about once a
 # second; the badge screen shows "sent" climbing; every loop prints a line to the
 # serial console (PB14 TX, 1000000 8N1) so you can follow it from a terminal even
-# with the badge face-down; and Badgy himself gets a mouse to push, so the home
-# screen says what is going on even after you leave this running in the
-# background with LEFT + RIGHT.
+# with the badge face-down; and Badgy himself gets a mouse to push for as long
+# as this is running, so the home screen says what is going on even after you
+# leave it in the background with LEFT + RIGHT.
 #
 #   WHEEL UP / WHEEL DN   wider / narrower motion
 #   WHEEL IN              pause / resume
@@ -107,7 +107,7 @@ loops = 0
 last = 0        # keys held on the previous pass
 was_live = False
 showing = False  # this script's own page: the stats, or the badger
-held = False    # whether Badgy is currently ours
+held = 0        # what we last asked Badgy to do; see the loop
 
 
 def leg(n, dx, dy):
@@ -168,20 +168,38 @@ while True:
             print('jiggle.py: host gone')
         was_live = live
 
-    # Take the mascot while there is jiggling to show, and hand him straight
-    # back when there is not -- only on the change, because asking every pass
-    # would mean the home screen could never say anything else about the badge
-    # while this is running.
-    want = live and not paused
+    # Take the mascot for as long as this is on duty, and hand him straight back
+    # when it is not -- only on the change, because asking every pass would mean
+    # the home screen could never say anything else about the badge while this
+    # is running.
+    #
+    # On duty is "not paused", not "a host is listening". The home screen is
+    # what you look at with the badge on a table, which is often the moment the
+    # cable is out; gating the mascot on a live host would take the mouse out of
+    # his paw at exactly the time you went to look at it. So he holds it either
+    # way, and only jiggles it when there is something on the other end.
+    #
+    #   0  not ours    1  jiggling    2  holding it, nothing listening
+    want = 0
+    if not paused:
+        if live:
+            want = 1
+        else:
+            want = 2
     if want != held:
         held = want
-        if want:
+        if want == 0:
+            badgy_mood(BADGY_AUTO)
+            badgy_say('')
+        elif want == 1:
             if not badgy_mood(frame_a, frame_b):
                 print('jiggle.py: another script has Badgy')
             badgy_say('jiggling')
         else:
-            badgy_mood(BADGY_AUTO)
-            badgy_say('')
+            # One frame, not two: a badger waving a mouse nothing is reading
+            # would be claiming to do something he is not.
+            badgy_mood(frame_a)
+            badgy_say('no host')
 
     clear()
     if showing:
