@@ -65,6 +65,8 @@ pub struct State {
     pub busy: bool,
     /// A host has the drive mounted.
     pub mounted: bool,
+    /// A script is running, whether or not it is the thing on screen.
+    pub working: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -74,6 +76,8 @@ pub enum Mood {
     Asleep,
     /// Digging: the host is dropping files on the drive.
     Digging,
+    /// A script is running and has not said what it wants him doing.
+    Working,
     /// Showing off the cable.
     Plugged,
     Upset,
@@ -81,12 +85,15 @@ pub enum Mood {
 
 impl Mood {
     /// The `BADGY_*` id a script names this mood by.
+    ///
+    /// [`Mood::Working`] shares the digging frames: there is one animation for
+    /// "busy" and a script running is the other thing that is.
     pub fn id(self) -> i32 {
         match self {
             Mood::Idle => BADGY_IDLE,
             Mood::Blink => BADGY_BLINK,
             Mood::Asleep => BADGY_SLEEP,
-            Mood::Digging => BADGY_DIG,
+            Mood::Digging | Mood::Working => BADGY_DIG,
             Mood::Plugged => BADGY_PLUG,
             Mood::Upset => BADGY_OOPS,
         }
@@ -164,8 +171,17 @@ impl Badgy {
         self.plug_left = self.plug_left.saturating_sub(1);
         self.upset_left = self.upset_left.saturating_sub(1);
 
+        // A running script outranks anything the USB side has to say, and comes
+        // before the doze timer: a badge left alone for a minute with a jiggler
+        // running is not idle, and a mascot that falls asleep on top of working
+        // firmware is the thing that makes a badge look dead. A script that has
+        // taken him says better than this what it is doing; this is what the
+        // ones that never ask get, so that "a script is running" is never
+        // something only the `1*` in the corner knows.
         self.mood = if self.upset_left > 0 {
             Mood::Upset
+        } else if st.working {
+            Mood::Working
         } else if st.busy {
             Mood::Digging
         } else if self.plug_left > 0 {
@@ -205,20 +221,22 @@ impl Badgy {
     /// Badgy is already in the mood he would have been in, instead of resuming
     /// from whatever he was doing when someone took him.
     ///
-    /// The one thing that outranks a script is [`Mood::Upset`]. A script has
-    /// just failed, and saying so is the firmware's job; it lasts a couple of
-    /// seconds, and if the failed script was the one holding him the hold is
-    /// gone anyway.
+    /// Nothing outranks the hold, [`Mood::Upset`] included. A script that has
+    /// taken the badger keeps him until it lets go or ends, which is what makes
+    /// the pose worth trusting: a badge showing the jiggler's mouse is jiggling,
+    /// full stop, rather than jiggling unless the drive happened to mount or
+    /// some *other* script fell over two seconds ago. The one crash that does
+    /// show through is the holder's own -- [`mascot::release`] frees the pin
+    /// when the task ends, so by the time [`Mood::Upset`] is on there is no hold
+    /// left to beat.
     pub fn art(&self) -> &'static dyn Pixels {
-        if self.mood != Mood::Upset {
-            if let Some((a, b)) = mascot::held() {
-                let id = if (self.frame / HOLD_SWAP) % 2 == 1 { b } else { a };
-                // Falling through on `None` is deliberate: a script may hold him
-                // on a slot it never filled, and an empty screen where the
-                // badger was is a worse answer than the badger.
-                if let Some(art) = frame_art(id, self.frame) {
-                    return art;
-                }
+        if let Some((a, b)) = mascot::held() {
+            let id = if (self.frame / HOLD_SWAP) % 2 == 1 { b } else { a };
+            // Falling through on `None` is deliberate: a script may hold him
+            // on a slot it never filled, and an empty screen where the
+            // badger was is a worse answer than the badger.
+            if let Some(art) = frame_art(id, self.frame) {
+                return art;
             }
         }
         frame_art(self.mood.id(), self.frame).unwrap_or(&sprites::IDLE_A)
@@ -246,6 +264,9 @@ impl Badgy {
         }
         match self.mood {
             Mood::Digging => "digging...",
+            // Same frames as digging, a different thing to say about them: this
+            // is the badge's own work, not a host's.
+            Mood::Working => "script running",
             Mood::Plugged => "drive mounted!",
             Mood::Asleep => "zzz - any key",
             Mood::Upset => "that went badly",

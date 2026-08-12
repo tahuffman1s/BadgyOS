@@ -343,8 +343,13 @@ def badger(
         arm(20, 52, 16, 59)
         arm(52, 52, 56, 67)
     elif arms == "hold":
+        # The paw goes all the way up to whatever is being held, so the thing
+        # sits *in* it. Stopping short and running a lead up to the object -- the
+        # way this used to -- reads as dangling it on a string, and leaves a gap
+        # that anything pasted over the object later has to either cover (and
+        # swallow the paw with it) or leave showing.
         arm(19, 52, 13, 62)
-        arm(52, 50, 59, 45)
+        arm(52, 50, 60, 42)
 
     # ---- eyes, over the stripes so there is something to look at. A solid lit
     # eye on a dark stripe needs no outline of its own.
@@ -399,19 +404,22 @@ def badger(
     # ---- things Badgy holds or emits. Drawn last: they are meant to be read as
     # in front of him.
     if held == "plug":
-        # A USB-A plug held up and clear of the head: shell, the tongue inside
-        # it, and a lead running down to the raised paw. Anything drawn in front
-        # of the chest ends up behind the chin, which reads as Badgy eating it.
-        c.rect(57, 25, 69, 37, INK)
-        c.rect(59, 27, 67, 35, DARK)
-        c.rect(61, 30, 65, 35, INK)      # the tongue
-        c.rect(61, 20, 65, 25, INK)      # cable gland
-        c.line(63, 37, 60, 44, INK, 2)   # lead down to the paw
+        # A USB-A plug standing in the raised paw: shell, the tongue inside it,
+        # and the cable gland on top. Anything drawn in front of the chest ends
+        # up behind the chin, which reads as Badgy eating it -- and anything much
+        # higher lands on his ear, which reads as a growth.
+        #
+        # The box is deliberately small. `computer_mouse` below has to cover it
+        # completely from two paste positions one bob apart, and the room between
+        # the ear and the paw is only about twenty rows.
+        c.rect(58, 28, 68, 38, INK)
+        c.rect(60, 30, 66, 36, DARK)
+        c.rect(61, 33, 65, 38, INK)      # the tongue
+        c.rect(61, 24, 65, 28, INK)      # cable gland
     elif held == "disk":
-        c.rect(56, 24, 70, 38, INK)
-        c.rect(59, 26, 67, 30, DARK)     # label
-        c.rect(61, 33, 65, 38, DARK)     # shutter
-        c.line(63, 38, 60, 44, INK, 2)
+        c.rect(58, 27, 68, 39, INK)
+        c.rect(60, 29, 66, 32, DARK)     # label
+        c.rect(61, 35, 65, 39, DARK)     # shutter
 
     if dirt:
         # Specks thrown clear of the paws. Two different sprays is what sells the
@@ -441,11 +449,16 @@ def badger(
 # is two rounded rectangles, and rounded rectangles typed by hand at 1bpp look
 # like potatoes.
 
-# Where the USB plug sits in the PLUGGED frame, from `held == "plug"` below:
-# shell x 57..69 / y 25..37, cable gland x 61..65 / y 20..25.
-PLUG_BOX = (57, 20, 69, 37)
+# Where the USB plug sits in the PLUGGED frame, from `held == "plug"` above:
+# shell x 58..68 / y 28..38, cable gland x 61..65 / y 24..28.
+PLUG_BOX = (58, 24, 68, 38)
 # Where a script pastes the mouse, and how far it bobs between the two frames.
-MOUSE_AT = (55, 17)
+#
+# The y is what makes this read as a mouse in a paw rather than a lump on a head:
+# the ear ends at row 20 and the paw pad starts at row 38, so the mouse has to
+# start below the one and finish on the other. `covers_plug` below is the test
+# that the pair still hides every pixel of the plug it is pasted over.
+MOUSE_AT = (55, 21)
 MOUSE_BOB = 2
 
 
@@ -469,18 +482,21 @@ def paste(rows, x, y, art):
     return out
 
 
-def computer_mouse(w=17, h=24):
+def computer_mouse(w=17, h=20):
     """A mouse, top-down, sized to cover the plug in the PLUGGED frame.
 
     That size is the whole design constraint. A script gets the badger by reading
     a frame back with `badgy_art()`, and the only pose with a paw raised to hold
     something is the one already holding a USB plug -- so this has to be opaque
     everywhere the plug is, or the plug shows around its edges. What it must
-    *not* cover is the lead running down from the plug to the paw, which then
-    reads as the mouse's cord for free.
+    *not* cover is the paw underneath, which is the thing that makes it read as
+    held rather than stuck to the side of his head.
 
-    Squared off rather than fully rounded for the same reason: a corner rounded
-    enough to look drawn is a corner the plug pokes out of.
+    Twenty rows is what is left between the bottom of the ear and the top of the
+    paw pad. It is the reason the plug it hides is drawn as small as it is.
+
+    Squared off rather than fully rounded: a corner rounded enough to look drawn
+    is a corner the plug pokes out of.
     """
     c = Canvas(w, h)
     cx = (w - 1) / 2
@@ -495,6 +511,37 @@ def computer_mouse(w=17, h=24):
     c.line(cx, 2, cx, h * 0.36, INK, 1)
     c.ellipse(cx, h * 0.30, 1.5, 2.5, INK)
     return c
+
+
+def uncovered_plug():
+    """Plug pixels the pasted mouse would leave showing. Empty is the good answer.
+
+    A stray one of these is not subtle: the plug is lit, so what shows is a white
+    corner sticking out from behind the mouse. The plug's own pixels are found by
+    drawing the pose twice and diffing, so this keeps checking the right thing
+    when the plug is redrawn.
+
+    Both paste positions are checked. The bob moves the mouse down by `MOUSE_BOB`
+    between the two frames, so it is the *intersection* of the two that has to
+    hide the plug -- covering it in one frame and not the other is a plug that
+    blinks in and out beside his head.
+    """
+    pose = dict(arms="hold", eyes="wide", mouth="smile")
+    plain = badger(**pose).rows()
+    plug = badger(held="plug", **pose).rows()
+    art = computer_mouse().rows()
+    mx, my = MOUSE_AT
+    missed = set()
+    for y, (a, bb) in enumerate(zip(plain, plug)):
+        for x, (ca, cb) in enumerate(zip(a, bb)):
+            if ca == cb:
+                continue
+            for dy in (0, MOUSE_BOB):
+                i, j = y - (my + dy), x - mx
+                over = art[i][j] if 0 <= i < len(art) and 0 <= j < len(art[i]) else " "
+                if over == " ":
+                    missed.add((x, y))
+    return sorted(missed)
 
 
 FRAMES = [
@@ -600,6 +647,7 @@ def emit_pycon():
     script pasting this treats a short row as one with nothing on the end, so
     the art means the same thing at half the size on the drive.
     """
+    check_mouse()
     rows = computer_mouse().rows()
     print("MOUSE = [")
     for r in rows:
@@ -701,8 +749,19 @@ SHOTS = (
 )
 
 
+def check_mouse():
+    """Stop rather than emit art the mouse does not fit over."""
+    missed = uncovered_plug()
+    if missed:
+        sys.exit(
+            f"the mouse leaves {len(missed)} plug pixel(s) showing, e.g. {missed[:6]}\n"
+            "-- widen or move `computer_mouse`, or shrink the plug in `badger`."
+        )
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "preview"
+    check_mouse()
     built = [(name, badger(**kw).rows()) for name, kw in FRAMES]
     by_name = dict(built)
     # Deliberately not in `built`: this frame is not part of the sheet and must

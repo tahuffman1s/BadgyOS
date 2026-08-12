@@ -25,28 +25,27 @@ REST_MS = 500   # pause between squares
 # Badgy is 72x74, which is far more art than belongs in a script -- so this does
 # not draw a badger. badgy_art() hands back the rows of a frame the badge
 # already has, and the only new art here is the mouse. BADGY_PLUG is the frame
-# with a paw raised, holding a USB plug up beside his head; pasting a mouse over
-# the plug leaves the pose, the paw and the lead, which then reads as the
-# mouse's cord. sprite() takes the result back and gives it a frame id, which
-# badgy_mood() holds him on until this script lets go or ends.
+# with a paw raised, holding a USB plug in it; pasting a mouse over the plug
+# swaps what he is holding and leaves the pose, the arm and the paw, so the
+# mouse ends up in his hand. sprite() takes the result back and gives it a frame
+# id, which badgy_mood() holds him on until this script lets go or ends.
 #
 # The mouse is generated: ./tools/badger.py pycon prints these rows, along with
 # where to paste them and how far to bob them. It is two rounded shapes, and
-# rounded shapes typed by hand at 1bpp look like potatoes.
+# rounded shapes typed by hand at 1bpp look like potatoes. Do not nudge MOUSE_Y
+# by hand either -- the plug has to be hidden from both bob positions, and the
+# ear above and the paw below leave exactly these twenty rows to do it in.
 
 MOUSE = [
     '     ######',
-    '    ########',
-    '   ##...#..##',
-    '  ##....#...##',
+    '   ##########',
+    '  ###...#..###',
     '  ##....#...##',
     ' ##....##....##',
     ' ##....##.....##',
     ' ##....##.....##',
     ' ##....##.....##',
-    ' ##....##.....##',
-    '##............##',
-    '##............##',
+    ' ##...........##',
     '##............##',
     '##............##',
     '##............##',
@@ -55,13 +54,12 @@ MOUSE = [
     '##............##',
     '##............##',
     ' ##..........##',
-    ' ##..........##',
-    '  ##........##',
+    ' ###........###',
     '   ##########',
     '    ########',
 ]
 MOUSE_X = 55      # over the plug in the BADGY_PLUG frame
-MOUSE_Y = 17
+MOUSE_Y = 21
 MOUSE_BOB = 2     # how far it moves between the two frames
 
 
@@ -108,6 +106,8 @@ last = 0        # keys held on the previous pass
 was_live = False
 showing = False  # this script's own page: the stats, or the badger
 held = 0        # what we last asked Badgy to do; see the loop
+mine = False    # whether that ask was granted
+moaned = False  # whether we have already said that someone else has him
 
 
 def leg(n, dx, dy):
@@ -168,38 +168,46 @@ while True:
             print('jiggle.py: host gone')
         was_live = live
 
-    # Take the mascot for as long as this is on duty, and hand him straight back
-    # when it is not -- only on the change, because asking every pass would mean
-    # the home screen could never say anything else about the badge while this
-    # is running.
+    # Take the mascot and keep him for as long as this script is running. He is
+    # never handed back from in here: paused or unplugged, a jiggler is still
+    # what the badge is currently doing, and the home screen is the only place a
+    # backgrounded script gets to say so. The firmware gives him back on its own
+    # when this ends, however it ends.
     #
-    # On duty is "not paused", not "a host is listening". The home screen is
-    # what you look at with the badge on a table, which is often the moment the
-    # cable is out; gating the mascot on a live host would take the mouse out of
-    # his paw at exactly the time you went to look at it. So he holds it either
-    # way, and only jiggles it when there is something on the other end.
+    # What changes is the pose and the line, which is why the mouse stays in his
+    # paw throughout and only *moves* when there is something on the other end
+    # of the cable to move it for.
     #
-    #   0  not ours    1  jiggling    2  holding it, nothing listening
-    want = 0
+    # Re-asked only when the answer would change -- asking every pass would cost
+    # a call per loop for nothing -- plus whenever the last ask was refused,
+    # since another script had him then and may be gone now.
+    #
+    #   1  jiggling    2  holding it, nothing listening    3  paused
+    want = 3
     if not paused:
         if live:
             want = 1
         else:
             want = 2
-    if want != held:
+    if want != held or not mine:
         held = want
-        if want == 0:
-            badgy_mood(BADGY_AUTO)
-            badgy_say('')
-        elif want == 1:
-            if not badgy_mood(frame_a, frame_b):
-                print('jiggle.py: another script has Badgy')
+        if want == 1:
+            mine = badgy_mood(frame_a, frame_b)
             badgy_say('jiggling')
-        else:
+        elif want == 2:
             # One frame, not two: a badger waving a mouse nothing is reading
             # would be claiming to do something he is not.
-            badgy_mood(frame_a)
+            mine = badgy_mood(frame_a)
             badgy_say('no host')
+        else:
+            mine = badgy_mood(frame_a)
+            badgy_say('paused')
+        if mine:
+            moaned = False
+        elif not moaned:
+            # Once, not once a pass: this loop runs several times a second.
+            moaned = True
+            print('jiggle.py: another script has Badgy')
 
     clear()
     if showing:

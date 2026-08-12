@@ -312,9 +312,14 @@ fn jiggle_py_builds_two_badger_frames_with_a_mouse_in_them() {
             })
             .collect();
         assert!(!ink.is_empty(), "frame {} came out empty -- nothing was pasted", n);
+        // The window is the gap between two bits of badger, and both edges are
+        // load-bearing. Above row 21 is his ear, and a mouse that starts there
+        // reads as a growth on his head rather than as something he is holding;
+        // below row 42 is the paw pad, which is the only thing making it read as
+        // held at all, so burying that loses the point of the frame too.
         assert!(
-            ink.iter().all(|&(x, y)| (55..ART_W).contains(&x) && (17..45).contains(&y)),
-            "frame {} painted outside where the plug is",
+            ink.iter().all(|&(x, y)| (55..ART_W).contains(&x) && (21..43).contains(&y)),
+            "frame {} painted outside the gap between Badgy's ear and his paw",
             n
         );
     }
@@ -340,6 +345,26 @@ fn jiggle_py_sends_nothing_with_no_host() {
     let base = pycon::host::SPRITE_SLOT_BASE;
     assert_eq!(host.held, (base, base), "unplugged, he should hold one frame rather than wave it");
     assert_eq!(host.caption, "no host");
+}
+
+#[test]
+fn jiggle_py_keeps_the_badger_while_it_is_paused() {
+    // Pausing stops the reports, not the script -- so it must not hand the
+    // mascot back. A jiggler that dropped the pose whenever it was paused would
+    // put the home screen back on the firmware's idle badger while a script it
+    // cannot see is still the thing the badge is doing.
+    //
+    // The wheel is reported held from the first pass, and the script only acts
+    // on the edge, so this pauses it once and leaves it paused.
+    let script = Script::compile(JIGGLE).unwrap();
+    let mut host = Bench::new(pycon::host::KEY_SELECT).with_mouse();
+    host.limit = 5_000;
+    assert_eq!(script.run(&mut host).unwrap(), Completion::Aborted);
+    assert_eq!(host.reports, 0, "a paused jiggler must not move the pointer");
+
+    let base = pycon::host::SPRITE_SLOT_BASE;
+    assert_eq!(host.held, (base, base), "paused, he should hold the mouse still rather than wave it");
+    assert_eq!(host.caption, "paused");
 }
 
 #[test]

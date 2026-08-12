@@ -403,8 +403,11 @@ impl App {
         match self.screen {
             Screen::Splash => {
                 self.rain.step();
-                self.badgy
-                    .step(crate::badgy::State { busy: self.scripts.busy(), mounted: usb::is_configured() });
+                self.badgy.step(crate::badgy::State {
+                    busy: self.scripts.busy(),
+                    mounted: usb::is_configured(),
+                    working: sched::running() > 0,
+                });
             }
             Screen::Demo => match self.demo {
                 Demo::Matrix => self.rain.step(),

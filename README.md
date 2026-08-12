@@ -46,8 +46,9 @@ home screen and reacts to what the firmware is doing.
 |---|---|---|
 | idle | nothing happening | slow breathing cycle, an occasional blink at irregular intervals |
 | digging | a host is writing to the script drive | both paws going, dirt flying |
-| plugged in | a host just mounted the drive | Badgy holds up the cable |
-| asleep | ~45 seconds without a key press | eyes shut, `z z z` |
+| working | a script is running and has not asked for him | the same paws, and `script running` under them |
+| plugged in | a host just mounted the drive | Badgy holds a cable up in one paw |
+| asleep | ~45 seconds without a key press, and nothing running | eyes shut, `z z z` |
 | rattled | the last script blew up | wide eyes, brows up, one bead of sweat |
 | yours | a script asked for him | whatever art it injected — see [below](#badgy-is-scriptable-too) |
 
@@ -205,7 +206,7 @@ giving it to `badgy_mood()` is how a script hands him back.
 
 ```python
 rows = badgy_art(BADGY_PLUG)     # his own art, as '#'/'.'/' ' strings
-paste(rows, 55, 17, MOUSE)       # ...painted on, in plain pycon
+paste(rows, 55, 21, MOUSE)       # ...painted on, in plain pycon
 frame = sprite(rows)             # ...kept by the badge, and given an id
 badgy_mood(frame, other)         # hold him on it, alternating the two
 badgy_say('jiggling')            # and a line under him
@@ -227,8 +228,11 @@ badgy_say('jiggling')            # and a line under him
 The hold is applied at the last moment, in `Badgy::art`, rather than by writing
 into the mood: the mood machine keeps running underneath, so when a script lets
 go he is already in the mood he would have been in rather than resuming from
-whatever he was doing when it took him. The one thing that outranks a script is
-**rattled** — a script just crashed, and saying so is the firmware's job.
+whatever he was doing when it took him. Nothing outranks the hold — not a drive
+mounting, not another script falling over. A script that has him keeps him until
+it lets go or ends, which is what makes the pose worth reading: a badge showing
+the jiggler's mouse *is* jiggling. The one crash that shows through is the
+holder's own, because the hold is released with the task.
 
 The art is copied into a `.bss` table rather than borrowed, because it has to
 outlive the call: a script's rows are on the interpreter's heap, and the mascot

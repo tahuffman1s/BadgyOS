@@ -73,8 +73,10 @@ handed back when your script ends. Rows are '#' (lit), '.'
 SPRITE_MAX_H, and SPRITE_SLOTS of them are kept at once; sprite()
 returns SPRITE_NONE when there is no room, which every call that
 takes a frame will quietly answer False to. jiggle.py builds a
-badger with a mouse under his paw this way, without drawing a
-badger: it paints into what badgy_art() gave it.
+badger with a mouse in his paw this way, without drawing a
+badger: it paints into what badgy_art() gave it. Nothing the
+firmware does outranks your hold, so keep him for as long as you
+are running and let the pose say what you are up to.
 
 Moods: BADGY_IDLE BADGY_BLINK BADGY_SLEEP BADGY_DIG BADGY_PLUG
        BADGY_OOPS

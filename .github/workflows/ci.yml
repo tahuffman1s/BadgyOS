@@ -138,6 +138,22 @@ jobs:
             exit 1
           fi
 
+      # The other half of the same trade. samples/jiggle.py carries a copy of
+      # the mouse and the coordinates it is pasted at, and those coordinates are
+      # only correct for the frame the generator drew: move the plug or the paw
+      # without re-running `pycon` and the badge quietly goes back to wearing the
+      # mouse on its ear. `pycon` itself refuses to print art that does not cover
+      # the plug, so this is the check that the script is carrying that art.
+      - name: The sample's mouse is the emitted one
+        run: |
+          ./tools/badger.py pycon > /tmp/mouse.py
+          python3 -c 'import sys; sys.exit(0 if open("/tmp/mouse.py").read().strip() in open("samples/jiggle.py").read() else 1)' || {
+            echo "::error::samples/jiggle.py does not carry ./tools/badger.py pycon output."
+            echo "Run ./tools/badger.py pycon and paste the block over the one in the sample."
+            diff /tmp/mouse.py <(sed -n '/^MOUSE = \[/,/^MOUSE_BOB/p' samples/jiggle.py) || true
+            exit 1
+          }
+
   firmware:
     name: firmware image
     runs-on: ubuntu-latest
