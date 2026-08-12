@@ -313,6 +313,21 @@ You need the `riscv32imac-unknown-none-elf` target (`rustup target add
 riscv32imac-unknown-none-elf`) — *not* the Xous target, since there is no Xous
 here.
 
+Or take the one CI built from the current `main`, which is the same recipe run
+on a clean machine against the pinned xous-core:
+
+```bash
+curl -LO https://github.com/tahuffman1s/BadgyOS/releases/download/latest/badgyos.uf2
+curl -LO https://github.com/tahuffman1s/BadgyOS/releases/download/latest/badgyos.uf2.sha256
+sha256sum -c badgyos.uf2.sha256
+```
+
+That link always points at the newest passing build; it is a rolling prerelease,
+so `/releases/latest` — which resolves to the newest *versioned* release — will
+not take you there. The checksum is worth verifying and the signature is not:
+the developer key's private half is published, so anyone can produce a valid
+one. [Read this before flashing either of them](#read-this-before-flashing).
+
 ### Why there is a bootstrap step
 
 BadgyOS links the Baochip board-support crates (`bao1x-hal`, `bao1x-api`,

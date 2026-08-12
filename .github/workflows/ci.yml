@@ -9,6 +9,12 @@ name: ci
 #   * `firmware` proves the image still links and signs, which needs a riscv
 #     target. It cannot check that the firmware *works* -- that takes a badge and
 #     a pair of eyes.
+#   * `rolling` publishes what `firmware` built, so the newest main is a download
+#     rather than a login-walled Actions artifact that expires in 90 days. It
+#     runs only after the other three pass, and only on main.
+#
+# Versioned releases are a different workflow: tag `v*` and release.yml builds
+# and publishes that tag. This one never makes a version claim.
 #
 # Both halves bootstrap vendor/xous-core, and the host half wishes it did not.
 # Nothing it compiles refers to that tree -- but `pycon` and `badgy-fat` are
@@ -194,3 +200,100 @@ jobs:
             target/riscv32imac-unknown-none-elf/release/badgyos.uf2
             target/riscv32imac-unknown-none-elf/release/badgyos.img
           if-no-files-found: error
+
+  rolling:
+    name: rolling release from main
+    # Only after everything else is green, so a release never carries an image
+    # whose language tests failed. And only on main: a pull request must not be
+    # able to publish.
+    needs: [host, sprites, firmware]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image the `firmware` job already built and validated, rather than a
+      # second build of the same commit. What is published is then the artifact
+      # that was actually checked, not one that merely should be identical.
+      - uses: actions/download-artifact@v4
+        with:
+          name: badgyos-uf2
+          path: dist
+
+      - name: Checksum, and re-read the image the way boot1 will
+        id: image
+        run: |
+          ./tools/badgeflash.py --dry-run dist/badgyos.uf2 | tee /tmp/validate.txt
+          (cd dist && sha256sum badgyos.uf2 > badgyos.uf2.sha256)
+          {
+            echo 'report<<EOF'
+            sed 's/^/    /' /tmp/validate.txt
+            echo EOF
+            # Re-read here rather than reusing the firmware job's step output:
+            # outputs do not cross jobs.
+            sed -n 's/^[[:space:]]*commit[[:space:]]*=[[:space:]]*//p' xous-core.pin | head -1 | sed 's/^/pin=/'
+          } >> "$GITHUB_OUTPUT"
+
+      # Move the tag to this commit before publishing, so the release page shows
+      # the source it was built from rather than wherever `latest` pointed last
+      # week. Force, because it is a rolling tag by design.
+      #
+      # This push cannot start another run: ci.yml triggers on branches, and
+      # release.yml only on tags matching `v*`.
+      - name: Move the rolling tag
+        run: |
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build from main
+          # A prerelease on purpose: it is a commit, not a version. Note that
+          # this also means /releases/latest -- which resolves to the newest
+          # *non*-prerelease -- will not point here, which is the intent. The
+          # stable link is the asset URL in the body below.
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/badgyos.uf2
+            dist/badgyos.uf2.sha256
+          body: |
+            The current state of `main`, rebuilt and replaced on every push.
+            Not a version: for one of those, see the tagged releases.
+
+            ```
+            ./tools/badgeflash.py badgyos.uf2
+            ```
+
+            Always the newest:
+            <https://github.com/${{ github.repository }}/releases/download/latest/badgyos.uf2>
+
+            ## Flashing this is irreversible
+
+            `badgyos.uf2` is signed with xous-core's **developer** key, whose
+            private half is published. When boot1 validates a developer-signed
+            image it erases the badge's secrets and increments the
+            `DEVELOPER_MODE` one-way counter:
+
+            * **`k0`, the DEF CON light-encryption key, is destroyed** and cannot
+              be recovered. Reflashing the stock firmware does not bring it back.
+              The badge is out of the conference light-breeding game for good.
+            * The badge is permanently marked as a developer device.
+
+            Because the signing key is public, this signature says nothing about
+            who built the file. Verify the checksum against this run, or build it
+            yourself -- `./bootstrap.sh && ./build.sh` is the whole recipe.
+
+            ## Image
+
+            ```
+            ${{ steps.image.outputs.report }}
+            ```
+
+            Built from `${{ github.sha }}` against xous-core
+            `${{ steps.image.outputs.pin }}`.
