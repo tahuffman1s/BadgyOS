@@ -24,12 +24,17 @@
 //!   polarity where a cleared bit is a lit pixel. Coordinates are clamped rather than trusted, so `rect(0, 0,
 //!   99999, 99999)` costs one screenful of work instead of billions of iterations.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use bao1x_hal::sh1107::{COLUMN, Mono, ROW};
 use pycon::host::{Abort, Host};
 use ux_api::minigfx::{ColorNative, FrameBuffer, Point};
 
+use crate::badgy;
 use crate::gfx::{self, Fb};
 use crate::input::{self, Key};
+use crate::mascot;
 use crate::platform;
 use crate::sched::{self, Ended, Status};
 use crate::usb;
@@ -422,7 +427,64 @@ impl Host for BadgeHost {
         self.service()?;
         Ok(true)
     }
+
+    fn badgy_art(&mut self, frame: i32) -> Option<Vec<String>> {
+        let art = badgy::frame_art(frame, badgy_tick())?;
+        // Rendered back out as the same `#`/`.`/space rows a script would write
+        // by hand, rather than as some packed form: what comes out of here goes
+        // straight back into `sprite()` after the script has painted on it, and
+        // a format that only round-trips through the firmware would make that a
+        // trick rather than an obvious thing to do.
+        let (w, h) = (art.width() as usize, art.height() as usize);
+        let mut rows = Vec::with_capacity(h);
+        for y in 0..h {
+            let mut row = String::with_capacity(w);
+            for x in 0..w {
+                row.push(match art.pixel(x, y) {
+                    gfx::INK => pycon::host::SPRITE_INK as char,
+                    gfx::DARK => pycon::host::SPRITE_DARK as char,
+                    _ => pycon::host::SPRITE_CLEAR as char,
+                });
+            }
+            rows.push(row);
+        }
+        Some(rows)
+    }
+
+    fn badgy_define(&mut self, rows: &[&str]) -> i32 { mascot::define(self.tid, rows, None) }
+
+    fn badgy_redefine(&mut self, slot: i32, rows: &[&str]) -> i32 {
+        mascot::define(self.tid, rows, Some(slot))
+    }
+
+    fn badgy_draw(&mut self, x: i32, y: i32, frame: i32) -> bool {
+        let Some(art) = badgy::frame_art(frame, badgy_tick()) else {
+            return false;
+        };
+        let (lit, dark) = (Self::color(true), Self::color(false));
+        // `put_pixel` clips, so an off-screen sprite costs one pass over its own
+        // pixels and draws nothing -- the same deal `pixel()` gets.
+        gfx::sprite(self.fb(), art, Point::new(x as isize, y as isize), lit, dark);
+        true
+    }
+
+    fn badgy_mood(&mut self, a: i32, b: i32) -> bool { mascot::hold(self.tid, a, b) }
+
+    fn badgy_say(&mut self, s: &str) -> bool { mascot::say(self.tid, s) }
 }
+
+/// The compositor's animation frame counter, near enough, from the clock.
+///
+/// A script's `badgy()` should breathe at the rate the home screen does, and the
+/// counter that drives that lives in the UI task's `Badgy` -- on another stack,
+/// and not advancing at all while a script is the thing on screen. Deriving it
+/// from the millisecond clock instead costs a division and is right in both
+/// cases.
+fn badgy_tick() -> u32 { platform::now_ms() / FRAME_MS }
+
+/// Roughly how long one of the compositor's frames takes, once the panel
+/// refresh is paid for. See [`crate::app`] for where the number comes from.
+const FRAME_MS: u32 = 45;
 
 /// Let go of anything the script was still holding when it ended.
 ///
@@ -434,6 +496,10 @@ impl Host for BadgeHost {
 impl Drop for BadgeHost {
     fn drop(&mut self) {
         release_usb(self.tid);
+        // And the badger, for the same reason: a script that pinned him and then
+        // hit the exit chord would otherwise leave the home screen holding a
+        // pose nothing is maintaining.
+        mascot::release(self.tid);
         if self.buttons == 0 {
             return;
         }

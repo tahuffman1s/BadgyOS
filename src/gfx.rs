@@ -161,27 +161,55 @@ pub fn line(fb: &mut dyn FrameBuffer, from: Point, to: Point, color: ColorNative
     }
 }
 
-/// Blit a [`crate::sprites::Sprite`] with its top-left corner at `at`.
+// ---------------------------------------------------------------- sprites
+//
+// Three states per pixel, which is what lets Badgy sit on top of a live
+// animation: lit draws white, dark draws black, and clear is left alone. A
+// two-state sprite would either have to be drawn on a cleared screen or leak
+// the background through the middle of the badger.
+
+pub const CLEAR: u8 = 0;
+pub const INK: u8 = 1;
+pub const DARK: u8 = 2;
+
+/// Anything the sprite blitter can read pixels out of.
 ///
-/// Three states per pixel, which is what lets Badgy sit on top of a live
-/// animation: `#` draws lit, `.` draws dark, and a space is left alone. A
-/// two-state sprite would either have to be drawn on a cleared screen or leak
-/// the background through the middle of the badger.
-///
-/// Rows shorter than `w` are treated as trailing spaces, so the art may be
-/// right-trimmed in the source without changing what it draws.
-pub fn sprite(
-    fb: &mut dyn FrameBuffer,
-    s: &crate::sprites::Sprite,
-    at: Point,
-    ink: ColorNative,
-    dark: ColorNative,
-) {
-    for y in 0..s.h as usize {
-        for x in 0..s.w as usize {
-            let color = match s.at(x, y) {
-                b'#' => ink,
-                b'.' => dark,
+/// There are two, and they are stored differently for good reasons that have
+/// nothing to do with each other: the sheet in [`crate::sprites`] is `&'static
+/// str` rows in FLASH, because art that never changes should cost image bytes
+/// and no RAM; a script's injected frame is a byte grid in `.bss`, because it
+/// arrives at runtime and has to be all-zeroes at boot. This trait is the one
+/// line where that stops mattering.
+pub trait Pixels {
+    fn width(&self) -> u16;
+    fn height(&self) -> u16;
+    /// [`CLEAR`], [`INK`] or [`DARK`] at `(x, y)`.
+    fn pixel(&self, x: usize, y: usize) -> u8;
+}
+
+impl Pixels for crate::sprites::Sprite {
+    fn width(&self) -> u16 { self.w }
+
+    fn height(&self) -> u16 { self.h }
+
+    /// Rows shorter than `w` read as trailing spaces, so the art may be
+    /// right-trimmed in the source without changing what it draws.
+    fn pixel(&self, x: usize, y: usize) -> u8 {
+        match self.at(x, y) {
+            b'#' => INK,
+            b'.' => DARK,
+            _ => CLEAR,
+        }
+    }
+}
+
+/// Blit a sprite with its top-left corner at `at`.
+pub fn sprite(fb: &mut dyn FrameBuffer, s: &dyn Pixels, at: Point, ink: ColorNative, dark: ColorNative) {
+    for y in 0..s.height() as usize {
+        for x in 0..s.width() as usize {
+            let color = match s.pixel(x, y) {
+                INK => ink,
+                DARK => dark,
                 _ => continue,
             };
             fb.put_pixel(Point::new(at.x + x as isize, at.y + y as isize), color);
@@ -192,13 +220,13 @@ pub fn sprite(
 /// Blit a sprite centred horizontally on a `width`-wide display.
 pub fn sprite_centered(
     fb: &mut dyn FrameBuffer,
-    s: &crate::sprites::Sprite,
+    s: &dyn Pixels,
     width: isize,
     y: isize,
     ink: ColorNative,
     dark: ColorNative,
 ) {
-    let x = (width - s.w as isize) / 2;
+    let x = (width - s.width() as isize) / 2;
     sprite(fb, s, Point::new(x.max(0), y), ink, dark);
 }
 

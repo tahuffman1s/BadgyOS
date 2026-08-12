@@ -36,6 +36,7 @@ mod badgy;
 mod debug;
 mod gfx;
 mod input;
+mod mascot;
 mod menu;
 mod platform;
 mod runner;

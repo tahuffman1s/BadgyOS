@@ -8,6 +8,7 @@ written out as the '#'/'.'/' ' rows the firmware blits.
 
     ./tools/badger.py preview      # -> preview/badgy-sheet.png, one frame each
     ./tools/badger.py emit         # -> src/sprites.rs
+    ./tools/badger.py pycon        # -> the mouse, as rows for samples/jiggle.py
 
 src/sprites.rs is the source of truth for the firmware -- it is committed, and
 hand-editing a pixel there is fine and expected. Re-running `emit` overwrites
@@ -432,6 +433,70 @@ def badger(
         c.ellipse(68, 11, 1, 2, DARK)
 
     return c
+# --------------------------------------------------------------- accessories
+#
+# Not part of the sheet. This is art for a *script* to inject with `sprite()`,
+# emitted as pycon source by `./tools/badger.py pycon`. It lives here rather than
+# being typed into the script for the reason at the top of this file -- a mouse
+# is two rounded rectangles, and rounded rectangles typed by hand at 1bpp look
+# like potatoes.
+
+# Where the USB plug sits in the PLUGGED frame, from `held == "plug"` below:
+# shell x 57..69 / y 25..37, cable gland x 61..65 / y 20..25.
+PLUG_BOX = (57, 20, 69, 37)
+# Where a script pastes the mouse, and how far it bobs between the two frames.
+MOUSE_AT = (55, 17)
+MOUSE_BOB = 2
+
+
+def paste(rows, x, y, art):
+    """Draw `art` over `rows` at (x, y), spaces transparent.
+
+    The same six lines `samples/jiggle.py` runs on the badge, kept here so the
+    mock-ups show what the script actually produces rather than an artist's
+    impression of it.
+    """
+    out = list(rows)
+    for i, piece in enumerate(art):
+        ry = y + i
+        if not (0 <= ry < len(out)):
+            continue
+        row = list(out[ry])
+        for j, ch in enumerate(piece):
+            if ch != " " and 0 <= x + j < len(row):
+                row[x + j] = ch
+        out[ry] = "".join(row)
+    return out
+
+
+def computer_mouse(w=17, h=24):
+    """A mouse, top-down, sized to cover the plug in the PLUGGED frame.
+
+    That size is the whole design constraint. A script gets the badger by reading
+    a frame back with `badgy_art()`, and the only pose with a paw raised to hold
+    something is the one already holding a USB plug -- so this has to be opaque
+    everywhere the plug is, or the plug shows around its edges. What it must
+    *not* cover is the lead running down from the plug to the paw, which then
+    reads as the mouse's cord for free.
+
+    Squared off rather than fully rounded for the same reason: a corner rounded
+    enough to look drawn is a corner the plug pokes out of.
+    """
+    c = Canvas(w, h)
+    cx = (w - 1) / 2
+    # Palm and buttons as two overlapping ellipses, the lower one wider -- a
+    # mouse is a teardrop, narrow where the fingers go.
+    c.ellipse(cx, h * 0.62, w / 2, h * 0.40, INK)
+    c.ellipse(cx, h * 0.30, w / 2 - 1.5, h * 0.30, INK)
+    c.rect(1, h * 0.25, w - 2, h * 0.70, INK)
+    c.erode_into(c.mask(), 2, DARK)
+    # The split between the buttons, and the wheel sitting in it. Both lit, over
+    # the hollowed-out dark body.
+    c.line(cx, 2, cx, h * 0.36, INK, 1)
+    c.ellipse(cx, h * 0.30, 1.5, 2.5, INK)
+    return c
+
+
 FRAMES = [
     ("IDLE_A", dict()),
     ("IDLE_B", dict(breathe=1, eyes="happy")),
@@ -528,6 +593,23 @@ impl Sprite {
 '''
 
 
+def emit_pycon():
+    """Print the mouse as pycon source, for pasting into a script.
+
+    Rows are right-trimmed: trailing spaces are the transparent state, and a
+    script pasting this treats a short row as one with nothing on the end, so
+    the art means the same thing at half the size on the drive.
+    """
+    rows = computer_mouse().rows()
+    print("MOUSE = [")
+    for r in rows:
+        print(f"    '{r.rstrip()}',")
+    print("]")
+    print(f"MOUSE_X = {MOUSE_AT[0]}      # over the plug in the BADGY_PLUG frame")
+    print(f"MOUSE_Y = {MOUSE_AT[1]}")
+    print(f"MOUSE_BOB = {MOUSE_BOB}     # how far it moves between the two frames")
+
+
 def emit(frames):
     out = [RS_HEADER]
     for name, rows in frames:
@@ -615,6 +697,7 @@ SHOTS = (
     ("DIG_A", "digging...", 0x9E37),
     ("SLEEP", "zzz - any key", 0x51EB),
     ("OOPS", "that went badly", 0x0BAD),
+    ("JIGGLE", "jiggling", 0x6199),
 )
 
 
@@ -622,6 +705,10 @@ def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "preview"
     built = [(name, badger(**kw).rows()) for name, kw in FRAMES]
     by_name = dict(built)
+    # Deliberately not in `built`: this frame is not part of the sheet and must
+    # never reach `emit`. It is what a *script* makes at runtime out of a frame
+    # that is, and it is here so the mock-ups can show that happening.
+    by_name["JIGGLE"] = paste(by_name["PLUGGED"], *MOUSE_AT, computer_mouse().rows())
     if cmd == "preview":
         png(ROOT / "preview" / "badgy-sheet.png", [rows for _, rows in built])
         for name, rows in built:
@@ -644,11 +731,13 @@ def main():
         )
     elif cmd == "emit":
         emit(built)
+    elif cmd == "pycon":
+        emit_pycon()
     elif cmd == "ascii":
         which = sys.argv[2].upper() if len(sys.argv) > 2 else "IDLE_A"
         print("\n".join(by_name[which]))
     else:
-        sys.exit(f"usage: {sys.argv[0]} [preview|screen|docs|emit|ascii <FRAME>]")
+        sys.exit(f"usage: {sys.argv[0]} [preview|screen|docs|emit|pycon|ascii <FRAME>]")
 
 
 if __name__ == "__main__":

@@ -42,7 +42,23 @@ struct Bench {
     name: String,
     /// How many times the script asked to re-present the device.
     reattaches: u32,
+    /// Frames the script injected, in slot order.
+    sprites: Vec<Vec<String>>,
+    /// The frames the mascot is being held on, and the line under him.
+    held: (i32, i32),
+    caption: String,
+    /// How many frames the script drew into its own page.
+    drawn: u32,
 }
+
+/// The shape of a badger frame, for a bench that has no art in it.
+///
+/// Blank rows, but the right number of them and the right length: a script that
+/// paints into what `badgy_art` gives it indexes those rows, so a bench that
+/// returned something smaller would fail scripts that are perfectly correct on
+/// the badge, and one that returned nothing would not exercise them at all.
+const ART_W: usize = 72;
+const ART_H: usize = 74;
 
 impl Bench {
     fn new(key: u32) -> Self {
@@ -58,7 +74,16 @@ impl Bench {
             pid: pycon::host::USB_PID_DEFAULT,
             name: String::new(),
             reattaches: 0,
+            sprites: Vec::new(),
+            held: (pycon::host::BADGY_AUTO, pycon::host::BADGY_AUTO),
+            caption: String::new(),
+            drawn: 0,
         }
+    }
+
+    fn slot(&self, frame: i32) -> Option<usize> {
+        let i = usize::try_from(frame - pycon::host::SPRITE_SLOT_BASE).ok()?;
+        if i < self.sprites.len() { Some(i) } else { None }
     }
 
     fn with_mouse(mut self) -> Self {
@@ -132,6 +157,52 @@ impl Host for Bench {
         self.reattaches += 1;
         Ok(true)
     }
+
+    fn badgy_art(&mut self, frame: i32) -> Option<Vec<String>> {
+        if let Some(i) = self.slot(frame) {
+            return Some(self.sprites[i].clone());
+        }
+        if (pycon::host::BADGY_AUTO..=pycon::host::BADGY_MOOD_MAX).contains(&frame) {
+            return Some(vec![" ".repeat(ART_W); ART_H]);
+        }
+        None
+    }
+
+    fn badgy_define(&mut self, rows: &[&str]) -> i32 {
+        if self.sprites.len() >= pycon::host::SPRITE_SLOTS {
+            return pycon::host::SPRITE_NONE;
+        }
+        self.sprites.push(rows.iter().map(|r| String::from(*r)).collect());
+        pycon::host::SPRITE_SLOT_BASE + self.sprites.len() as i32 - 1
+    }
+
+    fn badgy_redefine(&mut self, slot: i32, rows: &[&str]) -> i32 {
+        match self.slot(slot) {
+            Some(i) => {
+                self.sprites[i] = rows.iter().map(|r| String::from(*r)).collect();
+                slot
+            }
+            None => pycon::host::SPRITE_NONE,
+        }
+    }
+
+    fn badgy_draw(&mut self, _x: i32, _y: i32, frame: i32) -> bool {
+        if self.badgy_art(frame).is_none() {
+            return false;
+        }
+        self.drawn += 1;
+        true
+    }
+
+    fn badgy_mood(&mut self, a: i32, b: i32) -> bool {
+        self.held = (a, b);
+        true
+    }
+
+    fn badgy_say(&mut self, s: &str) -> bool {
+        self.caption = String::from(s);
+        true
+    }
 }
 
 fn run(name: &str, src: &str, key: u32) -> Vec<String> {
@@ -198,6 +269,56 @@ fn jiggle_py_moves_the_mouse_when_a_host_is_listening() {
     assert!(host.reports >= 2, "expected an immediate out-and-back nudge, saw {}", host.reports);
     assert_eq!(host.buttons, 0, "a jiggler must never leave a button held");
     assert!(host.ticks > 100, "jiggle.py should yield regularly, saw {} ticks", host.ticks);
+
+    // With a host listening it should also have taken the mascot, so that the
+    // home screen says what is going on once the script is put in the
+    // background -- which is the way a jiggler is actually used.
+    let base = pycon::host::SPRITE_SLOT_BASE;
+    assert_eq!(host.held, (base, base + 1), "expected a two-frame hold");
+    assert_eq!(host.caption, "jiggling");
+}
+
+#[test]
+fn jiggle_py_builds_two_badger_frames_with_a_mouse_in_them() {
+    // The frames are built by painting into what `badgy_art` returns, which is
+    // the part of the sprite API most worth guarding: an off-by-one in the
+    // paste is not a crash, it is a badger with a mouse growing out of his ear,
+    // and nothing else in the suite would notice.
+    let script = Script::compile(JIGGLE).unwrap();
+    let mut host = Bench::new(0).with_mouse();
+    host.limit = 5_000;
+    assert_eq!(script.run(&mut host).unwrap(), Completion::Aborted);
+
+    assert_eq!(host.sprites.len(), 2, "expected one frame per half of the jiggle");
+    for (n, frame) in host.sprites.iter().enumerate() {
+        assert_eq!(frame.len(), ART_H, "frame {} is the wrong height", n);
+        for (y, row) in frame.iter().enumerate() {
+            assert_eq!(row.len(), ART_W, "frame {} row {} is the wrong width", n, y);
+            assert!(
+                row.bytes().all(|b| b == b'#' || b == b'.' || b == b' '),
+                "frame {} row {} has something other than sprite characters in it",
+                n,
+                y
+            );
+        }
+        // The bench's badger is blank, so every marked pixel in the result came
+        // from the mouse -- and it has to be up beside his head where the plug
+        // was, not spread over the frame.
+        let ink: Vec<(usize, usize)> = frame
+            .iter()
+            .enumerate()
+            .flat_map(|(y, row)| {
+                row.bytes().enumerate().filter(|(_, b)| *b != b' ').map(move |(x, _)| (x, y))
+            })
+            .collect();
+        assert!(!ink.is_empty(), "frame {} came out empty -- nothing was pasted", n);
+        assert!(
+            ink.iter().all(|&(x, y)| (55..ART_W).contains(&x) && (17..45).contains(&y)),
+            "frame {} painted outside where the plug is",
+            n
+        );
+    }
+    assert_ne!(host.sprites[0], host.sprites[1], "the two frames must differ or the hold does not animate");
 }
 
 #[test]
@@ -270,6 +391,11 @@ fn the_samples_only_use_documented_builtins() {
         "usb_pid",
         "usb_id",
         "usb_name",
+        "sprite",
+        "badgy_art",
+        "badgy",
+        "badgy_mood",
+        "badgy_say",
     ] {
         let used = ALL.iter().any(|s| s.contains(&format!("{}(", name)));
         if used {
@@ -291,6 +417,17 @@ fn the_samples_only_use_documented_builtins() {
         "MOUSE_MAX",
         "USB_VID",
         "USB_PID",
+        "BADGY_AUTO",
+        "BADGY_IDLE",
+        "BADGY_BLINK",
+        "BADGY_SLEEP",
+        "BADGY_DIG",
+        "BADGY_PLUG",
+        "BADGY_OOPS",
+        "SPRITE_NONE",
+        "SPRITE_SLOTS",
+        "SPRITE_MAX_W",
+        "SPRITE_MAX_H",
     ] {
         let used = ALL.iter().any(|s| s.contains(konst));
         if used {

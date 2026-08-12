@@ -28,9 +28,9 @@ that runs them on the badge.
 |---|---|
 | **Target** | DEF CON 34 badge core module (baosec-lite class), Baochip‑1x SoC |
 | **Shape** | `no_std` + `alloc`, no interrupts, one loop passed between cooperative tasks |
-| **Image** | one signed `badgyos.uf2`, 845 UF2 blocks (211 KiB of ReRAM) |
+| **Image** | one signed `badgyos.uf2`, 893 UF2 blocks (223 KiB of ReRAM) |
 | **Language** | `pycon` — a Python subset in 4.2 kLOC, zero dependencies |
-| **Tested** | 127 host tests over the language and the filesystem |
+| **Tested** | 141 host tests over the language and the filesystem |
 | **Warning** | flashing it **destroys your badge's `k0` permanently** — [read this](#read-this-before-flashing) |
 
 ---
@@ -49,6 +49,7 @@ home screen and reacts to what the firmware is doing.
 | plugged in | a host just mounted the drive | Badgy holds up the cable |
 | asleep | ~45 seconds without a key press | eyes shut, `z z z` |
 | rattled | the last script blew up | wide eyes, brows up, one bead of sweat |
+| yours | a script asked for him | whatever art it injected — see [below](#badgy-is-scriptable-too) |
 
 He is a 72×74 **three-state** sprite — lit, dark, transparent — which is what
 lets him sit on top of the animated background: his dark pixels black the matrix
@@ -75,6 +76,7 @@ to be ported back into `tools/badger.py` rather than silently drifting.
 ./tools/badger.py preview    # -> preview/, every frame as a PNG at 6x
 ./tools/badger.py screen     # -> preview/badgy-home.png, the whole 128x128 panel
 ./tools/badger.py emit       # -> src/sprites.rs
+./tools/badger.py pycon      # -> the mouse, as rows to paste into a script
 ./tools/badger.py docs       # -> the two PNGs in this README
 ```
 
@@ -152,11 +154,12 @@ while True:
 | **input** | `keys()` `wait_key()` |
 | **mouse** | `mouse_ready()` `mouse_move(dx,dy[,wheel])` `mouse_buttons(mask)` `mouse_click([button])` |
 | **usb** | `usb_vid()` `usb_pid()` `usb_id(pid)` / `usb_id(vid,pid)` `usb_name(s)` |
+| **badgy** | `badgy(x,y[,frame])` `badgy_art(frame)` `sprite(rows[,id])` `badgy_mood(a[,b])` `badgy_say(s)` |
 | **other** | `sleep(ms)` `rand([n[,m]])` `print(...)` → serial console |
 | **builtins** | `len str int bool chr ord hex abs min max sum range` |
 | **list** | `append pop insert remove index count clear reverse extend copy sort` |
 | **str** | `upper lower strip startswith endswith find replace split join` |
-| **consts** | `WIDTH HEIGHT KEY_* MOUSE_LEFT MOUSE_RIGHT MOUSE_MIDDLE MOUSE_MAX USB_VID USB_PID` |
+| **consts** | `WIDTH HEIGHT KEY_* MOUSE_LEFT MOUSE_RIGHT MOUSE_MIDDLE MOUSE_MAX USB_VID USB_PID BADGY_* SPRITE_*` |
 
 ### The USB device is script-driven, identity and all
 
@@ -184,6 +187,60 @@ image, none of the script-loading path changed to support it — a script is sti
 text on a FAT volume, run through the interpreter, drawing and now also
 *presenting* through the `Host` trait.
 
+### Badgy is scriptable too
+
+A script that can drive the screen but not the mascot can only ever *borrow* the
+badge — the moment it exits, everything it did is gone. So Badgy is part of the
+API. One `int` names any frame there is: a `BADGY_*` mood, or an id that
+`sprite()` handed back. `BADGY_AUTO` means "whatever he is doing right now", and
+giving it to `badgy_mood()` is how a script hands him back.
+
+```python
+rows = badgy_art(BADGY_PLUG)     # his own art, as '#'/'.'/' ' strings
+paste(rows, 55, 17, MOUSE)       # ...painted on, in plain pycon
+frame = sprite(rows)             # ...kept by the badge, and given an id
+badgy_mood(frame, other)         # hold him on it, alternating the two
+badgy_say('jiggling')            # and a line under him
+```
+
+- **`badgy(x, y[, frame])`** draws a frame into the script's own page, so a
+  script can put the badger in its own UI. With no frame it draws the mood the
+  home screen is showing.
+- **`sprite(rows)`** copies the art into one of `SPRITE_SLOTS` (4) frames of at
+  most 80×80 and returns its id, or `SPRITE_NONE` if there is no room —
+  which every call taking a frame accepts and answers `False` to, so a badge
+  with no slots left never *stops* a script. `sprite(rows, id)` overwrites a
+  frame the script already owns, so an animation costs one slot, not one a pass.
+- **`badgy_mood(a[, b])`** holds him on `a`, alternating with `b`. There is one
+  badger, so the first script to ask keeps him and the rest get `False` — the
+  same rule the mouse and the USB identity already use. He goes back to the
+  firmware when the script ends, however it ends.
+
+The hold is applied at the last moment, in `Badgy::art`, rather than by writing
+into the mood: the mood machine keeps running underneath, so when a script lets
+go he is already in the mood he would have been in rather than resuming from
+whatever he was doing when it took him. The one thing that outranks a script is
+**rattled** — a script just crashed, and saying so is the firmware's job.
+
+The art is copied into a `.bss` table rather than borrowed, because it has to
+outlive the call: a script's rows are on the interpreter's heap, and the mascot
+is composited by task 0 long afterwards, usually while the script is parked
+inside a `sleep()`. That is also what bounds the cost — four frames, always,
+whatever the scripts do.
+
+Injected frames show up on the end of the **Badgy** screen's roll, which is the
+only way to look at one on its own: on the home screen it is composited over the
+rain, and inside the script that made it, it may never be drawn at all.
+
+`jiggle.py` does the whole of this in about thirty lines, and never draws a
+badger — 72×74 of art does not belong in a script. It reads back the one pose
+with a paw raised (`BADGY_PLUG`, holding a USB plug), pastes a mouse over the
+plug, and keeps the lead, which then reads as the mouse's cord. That is the last
+panel of the picture at the top of this README, and it was composited by the same
+six lines of `paste()` the script runs on the badge. The mouse itself comes out
+of `./tools/badger.py pycon`, for the reason every other shape here does: two
+rounded rectangles typed by hand at 1bpp look like potatoes.
+
 ---
 
 ## Controls
@@ -194,7 +251,7 @@ the same 2×3 matrix as the three face buttons.
 
 | Input | Menu | Home screen | Demo | Button test | USB drive | Badgy | Tasks |
 |---|---|---|---|---|---|---|---|
-| wheel roll | move cursor | open menu | exit | — | — | next frame | move cursor |
+| wheel roll | move cursor | open menu | exit | — | — | next frame* | move cursor |
 | wheel press | select | open menu | exit | hold 1s to exit | hold 2s to format | back | view / result |
 | left button | back | open menu | exit | — | back | back | back |
 | center | select | open menu | exit | — | back | back | view / result |
@@ -203,6 +260,9 @@ the same 2×3 matrix as the three face buttons.
 In the **scripts** list, wheel-press and center run a script in front of you;
 **right** starts it in the background instead. Either way it is a task — running
 one in the foreground only means its page is the one on screen.
+
+\* the **Badgy** screen rolls through the eight frames of the sheet and then
+through any a script has injected, labelled with the id it was given.
 
 While a script is on screen it owns the keys, so the two ways out are chords:
 
@@ -233,7 +293,7 @@ when `n` scripts are running behind it.
 | camera, accelerometer, TRNG, BIO | never initialized |
 | interrupts | none — one polling loop |
 | preemptive threads, MMU-isolated | 4 cooperative tasks, one address space |
-| 690 UF2 blocks (loader alone) | **845 UF2 blocks** |
+| 690 UF2 blocks (loader alone) | **893 UF2 blocks** |
 
 What is left: reset vector, clock/PLL bring-up, a timer, a transmit-only serial
 console, the SH1107 driver, a polled key matrix, an 864-byte bitmap font, a USB
@@ -257,6 +317,7 @@ src/
   gfx.rs        6x12 text (vendored from boot1) + lines, rects, sprites
   sprites.rs    Badgy, 8 frames of 72x74, generated by tools/badger.py
   badgy.rs      which frame to draw: moods, blink timing, captions
+  mascot.rs     what a script may do to him: injected frames, and the hold
   input.rs      jog wheel + buttons: 2x3 matrix scan, debounce, auto-repeat
   anim.rs       ASCII animations: matrix rain, doom fire, plasma
   menu.rs       scrolling list widget, the static menu tree, the ItemList seam
@@ -292,7 +353,7 @@ this firmware that can be tested without a badge.
 cargo test --target x86_64-unknown-linux-gnu -p pycon -p badgy-fat --features std
 ```
 
-127 tests, and the FAT ones are worth a look: they shell out to `mkfs.fat` and
+141 tests, and the FAT ones are worth a look: they shell out to `mkfs.fat` and
 `fsck.fat` and check the parser against volumes real tools produced, and pin the
 long-filename path against directory entries captured byte-for-byte from a Linux
 host doing a `cp`. Reading FAT from the spec is how you write a parser that only
@@ -369,7 +430,7 @@ and handle that action plus a `Screen` variant in `src/app.rs`.
 
 `.github/workflows/ci.yml` runs three jobs:
 
-- **host** — the 127 tests, a no-`std` build of both library crates, `rustfmt
+- **host** — the 141 tests, a no-`std` build of both library crates, `rustfmt
   --check` and `clippy -D warnings`. Needs no badge, no riscv target and no
   xous-core. This is what gates a merge.
 - **sprites** — re-runs `tools/badger.py emit` and diffs `src/sprites.rs`.
@@ -561,7 +622,7 @@ at all — keep `VOL_LBA_BASE` parameterized in case one of them needs the MBR
 wrapper.
 
 **Also not yet verified on hardware: the scheduler.** It builds, it packages, and
-the 127 host tests still pass — but none of them exercise a context switch,
+the host tests still pass — but none of them exercise a context switch,
 because the switch is assembly for a target the test bench does not run. What to
 watch for on a badge, in the order they would show up: whether the first switch
 into a fresh task lands in the trampoline at all (a wrong `ra` offset or a stack
@@ -634,14 +695,16 @@ Other things that had to be shared out, and how:
 |---|---|
 | the keys | only the focused task sees them; the rest read an empty matrix |
 | the mouse and USB identity | one bus, so first task to ask keeps them; others get `False`, which the API could already say |
+| the badger | one of him, so the same rule again; his sprite slots are per-task and go back when the task ends |
 | the heap | not partitioned. 768 KiB between three scripts, and whoever crosses `HEAP_RESERVE` is the one that fails |
 | the stacks | 48 KiB each in `.bss`, with a poisoned kilobyte at the bottom probed on every switch — under three tasks, running off the end would corrupt a *neighbour*, so it stops the task with "ran out of stack" instead |
 | the allocator | its lock is never held across a switch, because switches happen only where `sched` puts them and none is inside `alloc`. True of cooperative scheduling, false of preemption |
 
-What it costs: 96 KiB more `.bss` (688 KiB total, still 592 KiB clear under the
-boot stack), 25 UF2 blocks, and about thirty instructions per switch. What is
+What it costs: 96 KiB more `.bss` (712 KiB total once the mascot's sprite table
+is in there too, still 568 KiB clear under the boot stack), 25 UF2 blocks, and
+about thirty instructions per switch. What is
 unchanged: `pycon` itself, which needed no modification at all — the `Host` trait
-was already the right seam — so all 127 host tests still run on a laptop.
+was already the right seam — so every host test still runs on a laptop.
 
 ---
 

@@ -74,6 +74,12 @@ pub enum Builtin {
     UsbPid,
     UsbId,
     UsbName,
+    // badge: the badger
+    Sprite,
+    BadgyArt,
+    BadgyDraw,
+    BadgyMood,
+    BadgySay,
 }
 
 impl Builtin {
@@ -110,6 +116,11 @@ impl Builtin {
             "usb_pid" => Builtin::UsbPid,
             "usb_id" => Builtin::UsbId,
             "usb_name" => Builtin::UsbName,
+            "sprite" => Builtin::Sprite,
+            "badgy_art" => Builtin::BadgyArt,
+            "badgy" => Builtin::BadgyDraw,
+            "badgy_mood" => Builtin::BadgyMood,
+            "badgy_say" => Builtin::BadgySay,
             _ => return None,
         })
     }
@@ -132,6 +143,17 @@ pub fn constant(name: &str) -> Option<Value> {
         "MOUSE_MAX" => Value::Int(host::MOUSE_MAX_STEP),
         "USB_VID" => Value::Int(host::USB_VID_DEFAULT as i32),
         "USB_PID" => Value::Int(host::USB_PID_DEFAULT as i32),
+        "BADGY_AUTO" => Value::Int(host::BADGY_AUTO),
+        "BADGY_IDLE" => Value::Int(host::BADGY_IDLE),
+        "BADGY_BLINK" => Value::Int(host::BADGY_BLINK),
+        "BADGY_SLEEP" => Value::Int(host::BADGY_SLEEP),
+        "BADGY_DIG" => Value::Int(host::BADGY_DIG),
+        "BADGY_PLUG" => Value::Int(host::BADGY_PLUG),
+        "BADGY_OOPS" => Value::Int(host::BADGY_OOPS),
+        "SPRITE_NONE" => Value::Int(host::SPRITE_NONE),
+        "SPRITE_SLOTS" => Value::Int(host::SPRITE_SLOTS as i32),
+        "SPRITE_MAX_W" => Value::Int(host::SPRITE_MAX_W as i32),
+        "SPRITE_MAX_H" => Value::Int(host::SPRITE_MAX_H as i32),
         _ => return None,
     })
 }
@@ -171,6 +193,96 @@ fn button_mask(name: &str, v: i32) -> Result<u8, Fault> {
         )));
     }
     Ok(v as u8)
+}
+
+/// Validate a badger frame id: a mood, a slot, or [`host::SPRITE_NONE`].
+///
+/// `SPRITE_NONE` is allowed through everywhere a frame is taken, so a script may
+/// pass the result of a `sprite()` that found no room straight on to `badgy()`
+/// or `badgy_mood()` and get a `False` rather than a stopped program. Anything
+/// else out of range is a typo -- an id is a constant or something `sprite()`
+/// returned, never arithmetic -- and is named rather than silently ignored.
+fn frame_arg(name: &str, args: &[Value], i: usize) -> Result<i32, Fault> {
+    let v = int_arg(name, args, i)?;
+    let slot_top = host::SPRITE_SLOT_BASE + host::SPRITE_SLOTS as i32;
+    let ok = v == host::SPRITE_NONE
+        || (host::BADGY_AUTO..=host::BADGY_MOOD_MAX).contains(&v)
+        || (host::SPRITE_SLOT_BASE..slot_top).contains(&v);
+    if !ok {
+        return Err(bad(alloc::format!(
+            "{}() takes a BADGY_* frame or an id from sprite(), got {}",
+            name,
+            v
+        )));
+    }
+    Ok(v)
+}
+
+/// Pull a sprite's rows out of a script's list and check that they describe a
+/// frame the badge could actually blit.
+///
+/// The rows are cloned out of the list before anything is checked. They are
+/// `Rc<str>`, so that is a handful of refcount bumps rather than a copy of the
+/// art -- and it releases the list's borrow, which matters because the caller
+/// goes on to hand these to the host while the script still holds the list.
+fn sprite_rows(name: &str, args: &[Value], i: usize) -> Result<Vec<alloc::rc::Rc<str>>, Fault> {
+    let Value::List(l) = &args[i] else {
+        return Err(bad(alloc::format!(
+            "{}() argument {} must be a list of rows, got {}",
+            name,
+            i + 1,
+            args[i].type_name()
+        )));
+    };
+    let items = l.borrow().clone();
+    if items.is_empty() {
+        return Err(bad(alloc::format!("{}() needs at least one row", name)));
+    }
+    if items.len() > host::SPRITE_MAX_H {
+        return Err(bad(alloc::format!(
+            "{}() takes at most {} rows, got {}",
+            name,
+            host::SPRITE_MAX_H,
+            items.len()
+        )));
+    }
+    let mut rows = Vec::with_capacity(items.len());
+    for (n, v) in items.iter().enumerate() {
+        let Value::Str(s) = v else {
+            return Err(bad(alloc::format!("{}() row {} must be a str, got {}", name, n, v.type_name())));
+        };
+        // Byte length is character length only if the row is ASCII, and the
+        // three legal characters are. Checking the bytes therefore checks both
+        // at once, and a row of box-drawing characters is caught here with its
+        // row number rather than blitted as mojibake.
+        if s.len() > host::SPRITE_MAX_W {
+            return Err(bad(alloc::format!(
+                "{}() row {} is {} wide, over the {} limit",
+                name,
+                n,
+                s.chars().count(),
+                host::SPRITE_MAX_W
+            )));
+        }
+        for &b in s.as_bytes() {
+            if b != host::SPRITE_INK && b != host::SPRITE_DARK && b != host::SPRITE_CLEAR {
+                return Err(bad(alloc::format!(
+                    "{}() row {} has '{}' in it; rows are '#' (lit), '.' (black) and ' ' (clear)",
+                    name,
+                    n,
+                    // Printed as the byte when it is not something a terminal
+                    // would show as one character.
+                    if b.is_ascii_graphic() {
+                        alloc::format!("{}", b as char)
+                    } else {
+                        alloc::format!("\\x{:02x}", b)
+                    }
+                )));
+            }
+        }
+        rows.push(s.clone());
+    }
+    Ok(rows)
 }
 
 // ------------------------------------------------------------------ argument helpers
@@ -482,6 +594,61 @@ pub fn call(b: Builtin, args: &[Value], host: &mut dyn Host) -> R {
             arity("usb_name", args, 1, 1)?;
             let name = str_arg("usb_name", args, 0)?;
             Ok(Value::Bool(host.usb_set_name(name)?))
+        }
+
+        // --------------------------------------------------------- the badger
+        Builtin::Sprite => {
+            arity("sprite", args, 1, 2)?;
+            let rows = sprite_rows("sprite", args, 0)?;
+            let refs: Vec<&str> = rows.iter().map(|s| &**s).collect();
+            // A second argument names a slot to overwrite -- an animation redraws
+            // one frame over and over and should not need a slot per pass.
+            Ok(Value::Int(match args.len() {
+                1 => host.badgy_define(&refs),
+                _ => {
+                    let slot = frame_arg("sprite", args, 1)?;
+                    if slot < host::SPRITE_SLOT_BASE {
+                        return Err(bad(alloc::format!(
+                            "sprite() can only overwrite an id from sprite(), got {}",
+                            slot
+                        )));
+                    }
+                    host.badgy_redefine(slot, &refs)
+                }
+            }))
+        }
+        Builtin::BadgyArt => {
+            arity("badgy_art", args, 1, 1)?;
+            let frame = frame_arg("badgy_art", args, 0)?;
+            // An empty list for a frame that is not there, rather than None: a
+            // script's next move is a loop over the rows either way, and
+            // looping over nothing is the harmless version of that.
+            let rows = host.badgy_art(frame).unwrap_or_default();
+            Ok(Value::list(rows.into_iter().map(Value::str).collect()))
+        }
+        Builtin::BadgyDraw => {
+            arity("badgy", args, 2, 3)?;
+            let x = int_arg("badgy", args, 0)?;
+            let y = int_arg("badgy", args, 1)?;
+            let frame = if args.len() == 3 { frame_arg("badgy", args, 2)? } else { host::BADGY_AUTO };
+            Ok(Value::Bool(host.badgy_draw(x, y, frame)))
+        }
+        Builtin::BadgyMood => {
+            arity("badgy_mood", args, 1, 2)?;
+            let a = frame_arg("badgy_mood", args, 0)?;
+            // One frame holds him still, two alternate on the firmware's own
+            // animation clock -- which is the only clock that runs at the right
+            // rate, since a script pinning him is usually off doing something
+            // else and would otherwise have to drive the cycle from its own
+            // loop, at whatever period that loop happens to have.
+            let b = if args.len() == 2 { frame_arg("badgy_mood", args, 1)? } else { a };
+            Ok(Value::Bool(host.badgy_mood(a, b)))
+        }
+        Builtin::BadgySay => {
+            arity("badgy_say", args, 1, 1)?;
+            // Any value, stringified, for the same reason `text()` takes one.
+            let s = args[0].to_display();
+            Ok(Value::Bool(host.badgy_say(&s)))
         }
     }
 }

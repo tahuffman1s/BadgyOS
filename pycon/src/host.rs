@@ -6,6 +6,7 @@
 //! reason this crate builds and tests on a laptop.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 /// The script asked to stop, or the user asked for it to stop.
 ///
@@ -47,6 +48,59 @@ pub const MOUSE_MAX_STEP: i32 = 127;
 /// defaults and put the identity back the way it found it.
 pub const USB_VID_DEFAULT: u16 = 0x1d50;
 pub const USB_PID_DEFAULT: u16 = 0x6199;
+
+// -------------------------------------------------------------------- the badger
+//
+// The badge has a mascot, and a script can both draw him and take him over. One
+// integer names every frame there is: a mood the firmware already knows how to
+// animate, or a slot the script filled in itself with `sprite()`. Keeping it to
+// one `int` is what lets `badgy()`, `badgy_mood()` and `badgy_art()` all take
+// "a frame" without the language needing a type to say it with.
+
+/// Whatever the firmware would show right now. Also the value that *releases* a
+/// script's hold on the mascot, which is why it is the zero: `badgy_mood(0)` is
+/// "not mine any more", and a script that never asks for him is already there.
+pub const BADGY_AUTO: i32 = 0;
+pub const BADGY_IDLE: i32 = 1;
+pub const BADGY_BLINK: i32 = 2;
+pub const BADGY_SLEEP: i32 = 3;
+pub const BADGY_DIG: i32 = 4;
+pub const BADGY_PLUG: i32 = 5;
+pub const BADGY_OOPS: i32 = 6;
+/// Highest built-in mood id. Ids above this and below [`SPRITE_SLOT_BASE`] are
+/// unused, so a mood added later does not renumber anybody's slots.
+pub const BADGY_MOOD_MAX: i32 = BADGY_OOPS;
+
+/// First id handed out by `sprite()`. Slots are `SPRITE_SLOT_BASE ..
+/// SPRITE_SLOT_BASE + SPRITE_SLOTS`.
+pub const SPRITE_SLOT_BASE: i32 = 16;
+
+/// What `sprite()` returns when there was nowhere to put the art: every slot is
+/// taken, or this host has no badger at all. Not an error, for the same reason
+/// [`Host::mouse_move`] returning `false` is not one -- a script that draws a
+/// frame nobody can show is still a script that runs.
+pub const SPRITE_NONE: i32 = -1;
+
+/// How many script-supplied frames the badge holds at once. Four, because two
+/// is the smallest animation and a script that wants a cycle of them should not
+/// have to choose between animating and having a spare.
+pub const SPRITE_SLOTS: usize = 4;
+
+/// Largest script-supplied frame, in pixels. Badgy himself is 72x74, and the
+/// panel is 128 wide with a title band above and a caption band below, so a
+/// frame bigger than this could not be shown where he stands anyway.
+pub const SPRITE_MAX_W: usize = 80;
+pub const SPRITE_MAX_H: usize = 80;
+
+/// The three pixel states a sprite row is written with: lit, black, and leave
+/// alone. The third is what lets the badger sit on top of a live background.
+pub const SPRITE_INK: u8 = b'#';
+pub const SPRITE_DARK: u8 = b'.';
+pub const SPRITE_CLEAR: u8 = b' ';
+
+/// Longest caption a script can put under the badger, in characters -- the 6x12
+/// font gives 21 across a 128-pixel panel.
+pub const BADGY_CAPTION_MAX: usize = 21;
 
 pub trait Host {
     /// How many interpreter steps to run between [`Host::tick`] calls.
@@ -183,6 +237,84 @@ pub trait Host {
     fn usb_set_name(&mut self, name: &str) -> Result<bool, Abort> {
         let _ = name;
         Ok(false)
+    }
+
+    // ------------------------------------------------------------- the badger
+    //
+    // Badgy is the one part of the firmware that is *for* being looked at, so a
+    // script that can drive the screen but not him can only ever borrow the
+    // badge -- it cannot leave a mark on the thing the badge shows when nobody
+    // is doing anything. These five calls are that mark: read a frame, make a
+    // frame, draw a frame, pin the mascot to one, and give him something to
+    // say.
+    //
+    // Like the mouse, they all default to "there is no badger here", so the
+    // test bench needs no code to say so and a script written against them
+    // still runs to the end on a host that has none.
+
+    /// The rows of `frame`, in the `#`/`.`/space form `badgy_define` takes.
+    ///
+    /// This exists so a script can *start from* the badger rather than draw one:
+    /// 72x74 of hand-typed art is more than fits in a script, and a mascot that
+    /// can only be replaced wholesale is one nobody will touch. Read the idle
+    /// frame, paint something into it, hand it back.
+    ///
+    /// `None` for a frame this host does not have, including an empty slot.
+    fn badgy_art(&mut self, frame: i32) -> Option<Vec<String>> {
+        let _ = frame;
+        None
+    }
+
+    /// Take a copy of `rows` and return the frame id it can be reached by, or
+    /// [`SPRITE_NONE`] if there was no room for it.
+    ///
+    /// The copy is the point: the rows a script passes are on the interpreter's
+    /// heap and go away with the script, and the firmware needs the art to
+    /// outlive the call that drew it -- the mascot is composited by something
+    /// else entirely, long after the script has gone back to sleep.
+    ///
+    /// Rows are already known to be well-formed (three legal characters, inside
+    /// [`SPRITE_MAX_W`] by [`SPRITE_MAX_H`]) by the time they get here; that is
+    /// a script error and is caught where a line number is still available.
+    fn badgy_define(&mut self, rows: &[&str]) -> i32 {
+        let _ = rows;
+        SPRITE_NONE
+    }
+
+    /// Overwrite a slot this script already owns, returning its id or
+    /// [`SPRITE_NONE`] if it belongs to someone else.
+    ///
+    /// Without this an animation would be a slot leak: a loop that builds a
+    /// fresh frame each pass would take a new slot each pass and run out on the
+    /// fifth, having only ever needed one.
+    fn badgy_redefine(&mut self, slot: i32, rows: &[&str]) -> i32 {
+        let _ = (slot, rows);
+        SPRITE_NONE
+    }
+
+    /// Draw `frame` into this script's page with its top-left at `(x, y)`.
+    /// Returns whether there was such a frame to draw.
+    fn badgy_draw(&mut self, x: i32, y: i32, frame: i32) -> bool {
+        let _ = (x, y, frame);
+        false
+    }
+
+    /// Hold the mascot on `a`, alternating with `b` if the two differ, until the
+    /// script releases him with [`BADGY_AUTO`] or ends.
+    ///
+    /// Returns whether the hold took. `false` means another script has him --
+    /// there is one badger and, as with the mouse, the first to ask keeps him.
+    fn badgy_mood(&mut self, a: i32, b: i32) -> bool {
+        let _ = (a, b);
+        false
+    }
+
+    /// Put `s` under the badger, or restore his own lines if it is empty.
+    /// Truncated to [`BADGY_CAPTION_MAX`] rather than refused: a caption one
+    /// character too long is a layout problem, not a program that should stop.
+    fn badgy_say(&mut self, s: &str) -> bool {
+        let _ = s;
+        false
     }
 }
 

@@ -28,7 +28,11 @@
 //! 45 ms once the draw itself is paid for, so the constants below are in units
 //! of about 20 per second.
 
-use crate::sprites::{self, Sprite};
+use pycon::host::{BADGY_AUTO, BADGY_BLINK, BADGY_DIG, BADGY_IDLE, BADGY_OOPS, BADGY_PLUG, BADGY_SLEEP};
+
+use crate::gfx::Pixels;
+use crate::mascot;
+use crate::sprites;
 use crate::util::hash3;
 
 /// Frames of no key presses before Badgy dozes off.
@@ -43,6 +47,16 @@ const BLINK_FRAMES: u32 = 2;
 /// Average frames between blinks. The actual gap is this plus a hash-derived
 /// spread, because a blink on a fixed period reads as a flashing light.
 const BLINK_EVERY: u32 = 70;
+/// Frames per half of the idle breathing cycle. Two-frame cycles are
+/// deliberately slow: at ~20fps, alternating every frame is a flicker, not a
+/// breath.
+const IDLE_SWAP: u32 = 24;
+/// Frames per half of the digging cycle -- fast, because it is work.
+const DIG_SWAP: u32 = 4;
+/// Frames per half of a script's two-frame hold. Between the two above: a
+/// script that hands over a pair of frames means them to read as an action, and
+/// has no way to say how fast.
+const HOLD_SWAP: u32 = 12;
 
 /// What the rest of the firmware is doing, as far as Badgy is concerned.
 #[derive(Copy, Clone, Default)]
@@ -63,6 +77,47 @@ pub enum Mood {
     /// Showing off the cable.
     Plugged,
     Upset,
+}
+
+impl Mood {
+    /// The `BADGY_*` id a script names this mood by.
+    pub fn id(self) -> i32 {
+        match self {
+            Mood::Idle => BADGY_IDLE,
+            Mood::Blink => BADGY_BLINK,
+            Mood::Asleep => BADGY_SLEEP,
+            Mood::Digging => BADGY_DIG,
+            Mood::Plugged => BADGY_PLUG,
+            Mood::Upset => BADGY_OOPS,
+        }
+    }
+}
+
+/// The art behind a frame id, whether it is one of ours or one a script
+/// injected.
+///
+/// `tick` is a free-running animation counter; the two-frame moods divide it
+/// down themselves, so a caller does not have to know which moods are cycles or
+/// how fast they run. `None` for an id with nothing behind it -- an empty slot,
+/// or [`pycon::host::SPRITE_NONE`] passed straight through from a `sprite()`
+/// that found no room.
+pub fn frame_art(id: i32, tick: u32) -> Option<&'static dyn Pixels> {
+    // Resolved first, so every caller can hand this "whatever he is doing" and
+    // get the frame that is actually on the home screen.
+    let id = if id == BADGY_AUTO { mascot::shown() } else { id };
+    let cycle = |a: &'static sprites::Sprite, b: &'static sprites::Sprite, every: u32| {
+        if (tick / every) % 2 == 0 { a } else { b }
+    };
+    let sheet: &'static sprites::Sprite = match id {
+        BADGY_IDLE => cycle(&sprites::IDLE_A, &sprites::IDLE_B, IDLE_SWAP),
+        BADGY_BLINK => &sprites::BLINK,
+        BADGY_SLEEP => &sprites::SLEEP,
+        BADGY_DIG => cycle(&sprites::DIG_A, &sprites::DIG_B, DIG_SWAP),
+        BADGY_PLUG => &sprites::PLUGGED,
+        BADGY_OOPS => &sprites::OOPS,
+        _ => return mascot::art(id).map(|a| a as &'static dyn Pixels),
+    };
+    Some(sheet)
 }
 
 pub struct Badgy {
@@ -122,6 +177,12 @@ impl Badgy {
         } else {
             Mood::Idle
         };
+
+        // Published rather than returned, because the script that wants to know
+        // is on another stack entirely: `badgy(x, y)` with no frame named draws
+        // the badger as he is right now, and this is where "right now" is
+        // written down.
+        mascot::publish(self.mood.id());
     }
 
     /// True for [`BLINK_FRAMES`] out of every ~[`BLINK_EVERY`].
@@ -137,29 +198,30 @@ impl Badgy {
     }
 
     /// The frame to draw.
-    pub fn sprite(&self) -> &'static Sprite {
-        match self.mood {
-            // Two-frame cycles are deliberately slow: at ~20fps, alternating
-            // every frame is a flicker, not a breath.
-            Mood::Idle => {
-                if (self.frame / 24) % 2 == 0 {
-                    &sprites::IDLE_A
-                } else {
-                    &sprites::IDLE_B
+    ///
+    /// A script holding the mascot wins here, at the last possible moment,
+    /// rather than by writing into the mood: the state machine above keeps
+    /// running underneath, so when the script lets go -- or ends, or crashes --
+    /// Badgy is already in the mood he would have been in, instead of resuming
+    /// from whatever he was doing when someone took him.
+    ///
+    /// The one thing that outranks a script is [`Mood::Upset`]. A script has
+    /// just failed, and saying so is the firmware's job; it lasts a couple of
+    /// seconds, and if the failed script was the one holding him the hold is
+    /// gone anyway.
+    pub fn art(&self) -> &'static dyn Pixels {
+        if self.mood != Mood::Upset {
+            if let Some((a, b)) = mascot::held() {
+                let id = if (self.frame / HOLD_SWAP) % 2 == 1 { b } else { a };
+                // Falling through on `None` is deliberate: a script may hold him
+                // on a slot it never filled, and an empty screen where the
+                // badger was is a worse answer than the badger.
+                if let Some(art) = frame_art(id, self.frame) {
+                    return art;
                 }
             }
-            Mood::Blink => &sprites::BLINK,
-            Mood::Asleep => &sprites::SLEEP,
-            Mood::Digging => {
-                if (self.frame / 4) % 2 == 0 {
-                    &sprites::DIG_A
-                } else {
-                    &sprites::DIG_B
-                }
-            }
-            Mood::Plugged => &sprites::PLUGGED,
-            Mood::Upset => &sprites::OOPS,
         }
+        frame_art(self.mood.id(), self.frame).unwrap_or(&sprites::IDLE_A)
     }
 
     /// One line, in Badgy's voice, for under the sprite.
@@ -175,6 +237,13 @@ impl Badgy {
             "1d50:6199",
             "no k0, no regrets",
         ];
+        // A script's line, if it gave one. Not gated on `Upset` the way the
+        // sprite is: the caption is the only place a background script can say
+        // what it is doing, and losing it for two seconds because some *other*
+        // script crashed would be a lie about which one went wrong.
+        if let Some(s) = mascot::caption() {
+            return s;
+        }
         match self.mood {
             Mood::Digging => "digging...",
             Mood::Plugged => "drive mounted!",

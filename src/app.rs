@@ -39,6 +39,7 @@ use crate::anim::{Demo, Fire, MatrixRain, Plasma};
 use crate::badgy::Badgy;
 use crate::gfx::{self, CHAR_HEIGHT};
 use crate::input::{ALL_KEYS, Key, KeySet, Keys};
+use crate::mascot;
 use crate::menu::{self, Action, ItemList, MenuDef, MenuView, ScriptList};
 use crate::platform;
 use crate::sched::{self, Ended, Status};
@@ -522,7 +523,7 @@ impl App {
                 }
             }
             Screen::Badgy => {
-                let n = crate::sprites::ALL.len();
+                let n = self.sheet_len();
                 if fired.has(Key::Up) {
                     self.sheet = (self.sheet + n - 1) % n;
                 } else if fired.has(Key::Down) {
@@ -912,8 +913,7 @@ impl App {
         gfx::fill_rect(fb, Point::new(0, 0), Point::new(COLUMN - 1, 15), dark);
         glitched_centered(fb, "BadgyOS", 2, self.frame, lit, dark);
 
-        let badger = self.badgy.sprite();
-        gfx::sprite_centered(fb, badger, COLUMN, BADGY_TOP, lit, dark);
+        gfx::sprite_centered(fb, self.badgy.art(), COLUMN, BADGY_TOP, lit, dark);
 
         // A script running in the background is otherwise invisible from the
         // home screen, which is where the badge spends most of its life. One
@@ -937,24 +937,40 @@ impl App {
     /// panel but fine in `tools/badger.py`'s PNG has nowhere else to show
     /// itself. It also settles the "does the sprite blitter clip correctly"
     /// question on real hardware in about two seconds.
+    ///
+    /// Frames a script injected are on the end of the roll, which is the only
+    /// way to look at one on its own -- on the home screen it is composited over
+    /// the rain, and in the script that made it, it may never be drawn at all.
     fn render_badgy_sheet(&self, fb: &mut dyn FrameBuffer) {
         let lit: ColorNative = Mono::White.into();
         let dark: ColorNative = Mono::Black.into();
         let mut buf = FmtBuf::<32>::new();
 
-        let frames = crate::sprites::ALL;
-        let i = self.sheet.min(frames.len() - 1);
+        let sheet = crate::sprites::ALL;
+        let n = self.sheet_len();
+        let i = self.sheet.min(n - 1);
         header(fb, "BADGY");
-        gfx::sprite_centered(fb, frames[i], COLUMN, BADGY_TOP - 4, lit, dark);
-        gfx::msg_centered(
-            fb,
-            buf.format(format_args!("frame {}/{}", i + 1, frames.len())),
-            COLUMN,
-            ROW - CHAR_HEIGHT - 2,
-            lit,
-            dark,
-        );
+        let label = if i < sheet.len() {
+            gfx::sprite_centered(fb, sheet[i], COLUMN, BADGY_TOP - 4, lit, dark);
+            buf.format(format_args!("frame {}/{}", i + 1, n))
+        } else {
+            match mascot::filled().nth(i - sheet.len()) {
+                Some((id, art)) => {
+                    gfx::sprite_centered(fb, art, COLUMN, BADGY_TOP - 4, lit, dark);
+                    buf.format(format_args!("frame {}/{} slot {}", i + 1, n, id))
+                }
+                // A script ended and its slot was recycled between the key press
+                // and this repaint. Nothing to draw, and nothing worth saying
+                // beyond that it went.
+                None => buf.format(format_args!("frame {}/{} gone", i + 1, n)),
+            }
+        };
+        gfx::msg_centered(fb, label, COLUMN, ROW - CHAR_HEIGHT - 2, lit, dark);
     }
+
+    /// Frames the sheet screen can page through: the built-in roll, plus
+    /// whatever scripts have injected.
+    fn sheet_len(&self) -> usize { crate::sprites::ALL.len() + mascot::filled().count() }
 
     fn render_no_scripts(&self, fb: &mut dyn FrameBuffer) {
         let lit: ColorNative = Mono::White.into();

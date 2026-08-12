@@ -56,6 +56,29 @@ USB_VID and USB_PID are the badge's own defaults, so a script can
 put the identity back. usb_id() refuses one pair -- the
 bootloader's -- and returns False for it.
 
+Badgy -- the badger on the home screen is yours to drive. A frame
+is named by one int: a BADGY_* mood, or an id that sprite() gave
+back. BADGY_AUTO means "whatever he is doing right now", and
+handing it to badgy_mood() gives him back to the firmware.
+  badgy(x, y [, frame])     draw a frame into your own page
+  badgy_art(frame)          his rows, as a list of strings
+  sprite(rows)              keep art, return a frame id
+  sprite(rows, id)          ...overwriting a frame you own
+  badgy_mood(a [, b])       hold him on a, alternating with b
+  badgy_say(s)              the line under him; '' gives it back
+There is one badger, so the first script to ask for him keeps him
+and the others get False -- the same deal as the mouse. He is
+handed back when your script ends. Rows are '#' (lit), '.'
+(black) and ' ' (see-through), at most SPRITE_MAX_W by
+SPRITE_MAX_H, and SPRITE_SLOTS of them are kept at once; sprite()
+returns SPRITE_NONE when there is no room, which every call that
+takes a frame will quietly answer False to. jiggle.py builds a
+badger with a mouse under his paw this way, without drawing a
+badger: it paints into what badgy_art() gave it.
+
+Moods: BADGY_IDLE BADGY_BLINK BADGY_SLEEP BADGY_DIG BADGY_PLUG
+       BADGY_OOPS
+
 Also available: len str int bool chr ord hex abs min max sum
 range; list methods append pop insert remove index count clear
 reverse extend copy sort; string methods upper lower strip
