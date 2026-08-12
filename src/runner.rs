@@ -2,37 +2,46 @@
 //!
 //! `pycon` knows nothing about this hardware -- it draws through a trait,
 //! which is what lets it be tested on a laptop. This is the other side of that
-//! trait, and it is where three badge-specific concerns live:
+//! trait, and it is where the badge-specific concerns live:
 //!
-//! * **Keeping USB alive.** The interpreter calls [`Host::tick`] every couple of thousand steps, and every
-//!   blocking call (`sleep`, `wait_key`, `show`) routes through the same place. Since the whole firmware is
-//!   one loop, if a script did not yield, the drive would stop responding for as long as it ran.
+//! * **Keeping everything else alive.** The interpreter calls [`Host::tick`] every couple of thousand steps,
+//!   and every blocking call (`sleep`, `wait_key`, `show`) routes through the same place. That was already
+//!   how USB stayed serviced while a script ran; it is now also where the script gives up the CPU, so it is
+//!   the reason several scripts can run at once. See [`crate::sched`].
 //!
 //! * **Getting the badge back.** A script is untrusted text that arrived over USB, and `while True: pass` is
-//!   a legal program. Holding LEFT and CENTER together stops it. Two keys, because single keys belong to the
-//!   script -- `keys()` is part of the API and a game that could not read LEFT would be a poor one.
+//!   a legal program. Holding LEFT and CENTER together stops the script you are looking at. Two keys, because
+//!   single keys belong to the script -- `keys()` is part of the API and a game that could not read LEFT
+//!   would be a poor one. A script in the background is stopped from the task manager instead, which sets the
+//!   same flag and takes the same path out.
+//!
+//! * **Sharing what there is only one of.** A task draws into its own page rather than onto the panel, and
+//!   sees the keys only while it has focus. The mouse and the USB identity cannot be split that way -- there
+//!   is one bus and one descriptor set -- so the first task to ask for them keeps them, and the others are
+//!   told there is nothing listening, which is an answer the API already had to have.
 //!
 //! * **Hiding the panel.** Scripts see `on`/`off`, never `ColorNative`, and never the SH1107's inverted
 //!   polarity where a cleared bit is a lit pixel. Coordinates are clamped rather than trusted, so `rect(0, 0,
 //!   99999, 99999)` costs one screenful of work instead of billions of iterations.
 
-use bao1x_hal::sh1107::{COLUMN, Mono, Oled128x128, ROW};
+use bao1x_hal::sh1107::{COLUMN, Mono, ROW};
 use pycon::host::{Abort, Host};
 use ux_api::minigfx::{ColorNative, FrameBuffer, Point};
 
-use crate::gfx;
-use crate::input::{Key, Keys};
+use crate::gfx::{self, Fb};
+use crate::input::{self, Key};
 use crate::platform;
+use crate::sched::{self, Ended, Status};
 use crate::usb;
-use crate::util::Rng;
+use crate::util::{FmtBuf, Rng};
 
 /// Consecutive [`Host::tick`] calls the kill chord must be held for. The chord
 /// is sampled undebounced, so requiring a few in a row rejects contact bounce
 /// without adding a timer.
 const KILL_HOLD: u8 = 3;
 
-/// Passes of the internal wait loop between key samples, in milliseconds.
-const WAIT_STEP_MS: usize = 2;
+/// Milliseconds between key samples inside `wait_key`.
+const WAIT_STEP_MS: u32 = 2;
 
 /// How long to wait for the interrupt endpoint to drain before giving up on a
 /// mouse report, in `MOUSE_WAIT_STEP_MS` slices.
@@ -42,18 +51,80 @@ const WAIT_STEP_MS: usize = 2;
 /// stopped polling without dropping the configuration -- where blocking
 /// forever would hang the script on a cable someone walked away from.
 const MOUSE_WAIT_STEPS: u32 = 32;
-const MOUSE_WAIT_STEP_MS: usize = 2;
+const MOUSE_WAIT_STEP_MS: u32 = 2;
 
-pub struct BadgeHost<'a, 'd> {
-    disp: &'a mut Oled128x128<'d>,
-    keys: &'a mut Keys,
+/// The task holding the HID mouse and the USB identity, or 0 for nobody.
+///
+/// These are the two things a task cannot be given a private copy of: there is
+/// one interrupt endpoint and one set of descriptors, and changing the identity
+/// re-enumerates the whole device. Splitting them would mean two scripts
+/// fighting over what the badge *is* to the host, so instead the first script
+/// to ask gets them and keeps them until it ends.
+static mut USB_OWNER: usize = 0;
+
+/// Claim the mouse and identity for `tid`, or report that someone else has them.
+fn claim_usb(tid: usize) -> bool {
+    // safety: single hart, and no switch happens inside this function.
+    unsafe {
+        let owner = USB_OWNER;
+        if owner == 0 || owner == tid || !sched::used(owner) {
+            USB_OWNER = tid;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn release_usb(tid: usize) {
+    // safety: as `claim_usb`.
+    unsafe {
+        if USB_OWNER == tid {
+            USB_OWNER = 0;
+        }
+    }
+}
+
+/// Run a compiled script to completion and record how it went.
+///
+/// Called on the task's own stack by [`crate::sched::spawn`]'s trampoline; the
+/// program was parsed by whoever asked for the spawn.
+pub fn run_task(tid: usize, script: &pycon::Script, seed: u32) {
+    let mut host = BadgeHost::new(tid, seed);
+    // Formatted into a fixed buffer rather than a `String`, because the error
+    // most worth reading is the one raised by `heap_pressure` -- and asking the
+    // allocator for a message about running out of memory is a poor plan.
+    let mut msg = FmtBuf::<96>::new();
+    let ended = match script.run(&mut host) {
+        Ok(pycon::Completion::Finished) => Ended::Finished,
+        Ok(pycon::Completion::Aborted) => Ended::Stopped,
+        Err(e) => {
+            let _ = msg.format(format_args!("{}", e));
+            Ended::Failed
+        }
+    };
+    // Before recording the outcome, so the mouse button a killed script was
+    // holding is released while the slot still looks alive.
+    drop(host);
+    sched::finish(tid, ended, msg.as_str());
+}
+
+pub struct BadgeHost {
+    /// Which task this is. Everything shared is decided by it: whose page to
+    /// draw into, whether the keys are ours, whether the mouse is ours.
+    tid: usize,
+    /// This task's off-screen page, borrowed from the scheduler for the life of
+    /// the task. Raw because it is reached from two stacks -- this one, and the
+    /// compositor's, which only ever reads it while this task is suspended.
+    page: *mut Fb,
     rng: Rng,
     /// How many consecutive checks have seen the kill chord.
     kill_streak: u8,
     /// Raw key mask at the previous sample, for edge detection in `wait_key`.
     last_raw: u8,
-    /// Set once the chord has fired, so every later call gives up immediately
-    /// instead of the script getting a chance to ignore one `Abort`.
+    /// Set once the task has been told to stop, so every later call gives up
+    /// immediately instead of the script getting a chance to ignore one
+    /// `Abort`.
     stopped: bool,
     /// Mouse buttons the script is holding down. Kept here rather than in the
     /// USB module because it is script state: a move has to carry the buttons
@@ -61,9 +132,25 @@ pub struct BadgeHost<'a, 'd> {
     buttons: u8,
 }
 
-impl<'a, 'd> BadgeHost<'a, 'd> {
-    pub fn new(disp: &'a mut Oled128x128<'d>, keys: &'a mut Keys, seed: u32) -> Self {
-        BadgeHost { disp, keys, rng: Rng::new(seed), kill_streak: 0, last_raw: 0, stopped: false, buttons: 0 }
+impl BadgeHost {
+    pub fn new(tid: usize, seed: u32) -> Self {
+        BadgeHost {
+            tid,
+            page: sched::fb_ptr(tid),
+            rng: Rng::new(seed),
+            kill_streak: 0,
+            last_raw: 0,
+            stopped: false,
+            buttons: 0,
+        }
+    }
+
+    /// The page this task draws into.
+    #[inline]
+    fn fb(&mut self) -> &mut dyn FrameBuffer {
+        // safety: the pointer came from the scheduler's table for this task's
+        // own slot, which outlives the task, and no other task writes it.
+        unsafe { &mut *self.page }
     }
 
     /// Queue one HID report, waiting for the endpoint if it is still busy with
@@ -73,6 +160,9 @@ impl<'a, 'd> BadgeHost<'a, 'd> {
     /// because the thing being waited for is a USB completion -- and so the
     /// kill chord still works.
     fn report(&mut self, dx: i8, dy: i8, wheel: i8) -> Result<bool, Abort> {
+        if !claim_usb(self.tid) {
+            return Ok(false);
+        }
         for _ in 0..MOUSE_WAIT_STEPS {
             self.service()?;
             if !usb::hid::is_ready() {
@@ -81,17 +171,37 @@ impl<'a, 'd> BadgeHost<'a, 'd> {
             if usb::hid::send(self.buttons, dx, dy, wheel) {
                 return Ok(true);
             }
-            platform::delay_polled(MOUSE_WAIT_STEP_MS, &mut usb::poll);
+            sched::nap(MOUSE_WAIT_STEP_MS);
         }
         Ok(false)
     }
 
-    /// One sample of the key matrix plus a USB service pass. Everything that
-    /// blocks funnels through here.
+    /// One scheduling point: hand the CPU around, service USB, sample the keys,
+    /// and decide whether this task has been told to stop.
+    ///
+    /// Everything that blocks funnels through here, which is what makes the
+    /// yield unconditional -- a script cannot arrange to skip it.
     fn service(&mut self) -> Result<u8, Abort> {
-        usb::poll();
-        let raw = self.keys.scan_raw();
+        // Gives USB a pass and advances the clock even when nothing else is
+        // runnable, so this is still the full "keep the badge alive" call it
+        // was before there was anything to switch to.
+        sched::yield_now();
 
+        if self.stopped || sched::killed(self.tid) {
+            self.stopped = true;
+            return Err(Abort);
+        }
+
+        // The keys belong to whoever is on screen. A background task reading
+        // them would mean two scripts reacting to one press -- and the exit
+        // chord, held to stop the script you are looking at, would stop every
+        // script at once.
+        if !sched::is_focused(self.tid) {
+            self.kill_streak = 0;
+            return Ok(0);
+        }
+
+        let raw = input::scan_raw();
         let chord = Key::Left.bit() | Key::Center.bit();
         if raw & chord == chord {
             self.kill_streak = self.kill_streak.saturating_add(1);
@@ -114,11 +224,13 @@ impl<'a, 'd> BadgeHost<'a, 'd> {
     fn clamp(v: i32, hi: isize) -> isize { (v as isize).clamp(0, hi - 1) }
 }
 
-impl Host for BadgeHost<'_, '_> {
+impl Host for BadgeHost {
     fn tick_interval(&self) -> u32 {
         // Lower than the crate default. A script's inner loop is usually a few
         // dozen steps, so this checks the exit chord several times per frame
-        // while adding a rounding error's worth of overhead to real work.
+        // while adding a rounding error's worth of overhead to real work. It is
+        // also the scheduling quantum: a script that does nothing but compute
+        // still hands the badge around this often.
         512
     }
 
@@ -131,29 +243,35 @@ impl Host for BadgeHost<'_, '_> {
         // that just keeps a great many small things alive. Stopping here turns
         // an allocation failure (a panic, which on this device spins forever)
         // into a line of text on the panel.
+        //
+        // With several scripts sharing one heap this is also how they are held
+        // apart: the reserve is not divided between them, so whichever one asks
+        // for the allocation that would cross the line is the one that fails.
+        // That is rough justice -- it need not be the greedy one -- but it is
+        // the only rule that does not require a per-task quota nobody could
+        // pick a number for.
         platform::heap_free() < platform::HEAP_RESERVE
     }
 
     fn print_line(&mut self, s: &str) {
-        crate::println!("{}", s);
+        // Prefixed, because with several scripts running the console is shared
+        // and unlabelled output is ambiguous.
+        crate::println!("{}| {}", sched::name(self.tid), s);
     }
 
-    fn gfx_clear(&mut self) {
-        let fb: &mut dyn FrameBuffer = self.disp;
-        fb.clear();
-    }
+    fn gfx_clear(&mut self) { self.fb().clear(); }
 
     fn gfx_pixel(&mut self, x: i32, y: i32, on: bool) {
         // `put_pixel` clips on its own, so out-of-range values are simply
         // dropped rather than clamped onto the edge -- a clamped pixel would
         // draw a spurious line down the side of the screen.
-        let fb: &mut dyn FrameBuffer = self.disp;
-        fb.put_pixel(Point::new(x as isize, y as isize), Self::color(on));
+        let color = Self::color(on);
+        self.fb().put_pixel(Point::new(x as isize, y as isize), color);
     }
 
     fn gfx_text(&mut self, x: i32, y: i32, s: &str, on: bool) {
         let fg = Self::color(on);
-        let fb: &mut dyn FrameBuffer = self.disp;
+        let fb = self.fb();
         // Drawn transparently, so text over an existing shape does not punch a
         // rectangular hole in it. Scripts that want a background can draw one.
         let mut cursor = Point::new(x as isize, y as isize);
@@ -187,7 +305,7 @@ impl Host for BadgeHost<'_, '_> {
         let (ax, ay) = (Self::clamp(x0.min(x1), COLUMN), Self::clamp(y0.min(y1), ROW));
         let (bx, by) = (Self::clamp(x0.max(x1), COLUMN), Self::clamp(y0.max(y1), ROW));
         let color = Self::color(true);
-        let fb: &mut dyn FrameBuffer = self.disp;
+        let fb = self.fb();
         if fill {
             gfx::fill_rect(fb, Point::new(ax, ay), Point::new(bx, by), color);
         } else {
@@ -197,21 +315,19 @@ impl Host for BadgeHost<'_, '_> {
 
     fn gfx_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
         let color = Self::color(true);
-        let fb: &mut dyn FrameBuffer = self.disp;
-        gfx::line(
-            fb,
+        let (a, b) = (
             Point::new(Self::clamp(x0, COLUMN), Self::clamp(y0, ROW)),
             Point::new(Self::clamp(x1, COLUMN), Self::clamp(y1, ROW)),
-            color,
         );
+        gfx::line(self.fb(), a, b, color);
     }
 
     fn gfx_show(&mut self) -> Result<(), Abort> {
-        // The panel refresh is ~14 ms of blocking SPI and cannot be broken up
-        // from here, so bracket it: this is the one unavoidable gap in USB
-        // service, and the host will simply retry anything NAKed during it.
-        usb::poll();
-        self.disp.draw().ok();
+        // Nothing here touches the panel: the page is offered to the compositor
+        // and this task waits its turn. The wait is the point -- it is where a
+        // script's frame rate comes from, and where the other tasks get the
+        // milliseconds this one used to spend blocking on the SPI bus.
+        sched::show(self.tid);
         self.service().map(|_| ())
     }
 
@@ -226,35 +342,48 @@ impl Host for BadgeHost<'_, '_> {
         // Start from whatever is held now, so a key still down from the menu
         // selection that launched the script does not count as a press.
         self.last_raw = self.service()?;
-        loop {
-            platform::delay_polled(WAIT_STEP_MS, &mut usb::poll);
+        sched::set_status(self.tid, Status::Key);
+        let out = loop {
+            sched::nap(WAIT_STEP_MS);
             let raw = self.service()?;
             let pressed = raw & !self.last_raw;
             self.last_raw = raw;
             if pressed != 0 {
-                return Ok(pressed as u32);
+                break pressed as u32;
             }
-        }
+            // An unfocused task sees an empty matrix, so this is where a
+            // background script waiting on a key parks: it costs one scan every
+            // couple of milliseconds until someone brings it to the front.
+        };
+        sched::set_status(self.tid, Status::Run);
+        Ok(out)
     }
 
     fn sleep_ms(&mut self, ms: u32) -> Result<(), Abort> {
-        // Broken into short slices so a `sleep(10000)` is still interruptible
-        // and still services the drive.
-        let mut left = ms as usize;
-        while left > 0 {
-            let slice = left.min(4);
-            platform::delay_polled(slice, &mut usb::poll);
-            self.service()?;
-            left -= slice;
-        }
-        Ok(())
+        // Broken into short slices so a `sleep(10000)` is still interruptible,
+        // and measured against the clock rather than by counting delays --
+        // several tasks cannot each spin on the timer's one sticky flag. See
+        // `platform::tick_clock`.
+        let start = platform::now_ms();
+        sched::set_status(self.tid, Status::Sleep);
+        let out = loop {
+            if let Err(e) = self.service() {
+                break Err(e);
+            }
+            if platform::elapsed(start, ms) {
+                break Ok(());
+            }
+            sched::nap(1);
+        };
+        sched::set_status(self.tid, Status::Run);
+        out
     }
 
     fn random(&mut self) -> u32 { self.rng.next() }
 
     fn mouse_ready(&mut self) -> bool {
         usb::poll();
-        usb::hid::is_ready()
+        claim_usb(self.tid) && usb::hid::is_ready()
     }
 
     fn mouse_move(&mut self, dx: i8, dy: i8, wheel: i8) -> Result<bool, Abort> { self.report(dx, dy, wheel) }
@@ -270,9 +399,14 @@ impl Host for BadgeHost<'_, '_> {
     fn usb_ids(&mut self) -> (u16, u16) { usb::ids() }
 
     fn usb_set_identity(&mut self, vid: u16, pid: u16) -> Result<bool, Abort> {
+        if !claim_usb(self.tid) {
+            return Ok(false);
+        }
         // Give the kill chord a look before a re-enumeration takes the bus down
         // for the better part of a second, and pump the loop once after so the
-        // fresh controller is serviced before the script runs on.
+        // fresh controller is serviced before the script runs on. Every other
+        // task loses the drive for that time too, which is the honest cost of
+        // one script deciding what the badge is.
         self.service()?;
         let ok = usb::set_identity(vid, pid);
         self.service()?;
@@ -280,6 +414,9 @@ impl Host for BadgeHost<'_, '_> {
     }
 
     fn usb_set_name(&mut self, name: &str) -> Result<bool, Abort> {
+        if !claim_usb(self.tid) {
+            return Ok(false);
+        }
         self.service()?;
         usb::set_product_name(name);
         self.service()?;
@@ -287,15 +424,16 @@ impl Host for BadgeHost<'_, '_> {
     }
 }
 
-/// Let go of any mouse button the script was holding when it ended.
+/// Let go of anything the script was still holding when it ended.
 ///
 /// A script killed with the exit chord halfway through a drag would otherwise
 /// leave the host believing the button is still down -- and nothing else ever
 /// tells it otherwise, so the user's next click lands as the end of a selection
 /// they did not start. The release is best-effort: if there is no host, there
 /// is nothing holding anything.
-impl Drop for BadgeHost<'_, '_> {
+impl Drop for BadgeHost {
     fn drop(&mut self) {
+        release_usb(self.tid);
         if self.buttons == 0 {
             return;
         }
@@ -304,7 +442,7 @@ impl Drop for BadgeHost<'_, '_> {
             if !usb::hid::is_ready() || usb::hid::send(0, 0, 0, 0) {
                 return;
             }
-            platform::delay_polled(MOUSE_WAIT_STEP_MS, &mut usb::poll);
+            sched::nap(MOUSE_WAIT_STEP_MS);
         }
     }
 }

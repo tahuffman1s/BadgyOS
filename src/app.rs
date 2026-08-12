@@ -1,22 +1,35 @@
-//! The application: a screen state machine driven by the jog wheel.
+//! The application: a screen state machine driven by the jog wheel, and the
+//! compositor for everything else that draws.
 //!
 //! # The loop
 //!
-//! There is no scheduler and no interrupt in this firmware, so everything is
-//! paced by one polling loop. Each pass services the USB controller, samples
-//! the key matrix, gives the script importer a chance to notice that the drive
-//! changed, and repaints if anything is animating. Timing is counted in polls
-//! rather than milliseconds because a full `draw()` -- 2 KiB over a 2 MHz SPI --
-//! costs about as much as three polls, and trying to keep a real millisecond
-//! clock without a free-running counter would only pretend to be more accurate.
+//! This is task 0. It services the USB controller, samples the key matrix,
+//! gives the script importer a chance to notice that the drive changed, and
+//! repaints if anything is animating -- and then, instead of spinning out the
+//! rest of its 4 ms, it hands the badge to whatever scripts are running. See
+//! [`crate::sched`]. Timing is still counted in polls rather than milliseconds
+//! because a full `draw()` -- 2 KiB over a 2 MHz SPI -- costs about as much as
+//! three polls.
+//!
+//! # Who owns the panel
+//!
+//! This task, exclusively. Scripts draw into their own pages; the one with
+//! focus has its page copied onto the panel here and nowhere else. So the
+//! screen shows one of two things: a firmware screen drawn straight into the
+//! display buffer, or a script's page presented whole. [`Screen::ScriptView`]
+//! is the second case, and while it is up the keys belong to the script -- with
+//! two exceptions, both chords, because single keys are part of the script API:
+//! LEFT+CENTER stops the script (handled inside it, in `runner`), and
+//! LEFT+RIGHT leaves it running and comes back here.
 //!
 //! # Where USB fits
 //!
 //! `usb::poll()` is one register read when there is nothing to do, so it is
-//! called liberally: once per pass, inside every delay, and on both sides of a
-//! panel refresh. The refresh is the one place the loop is genuinely blind for
-//! ~14 ms, which is well inside what a host tolerates.
+//! called liberally: once per pass, on every task switch, and on both sides of
+//! a panel refresh. The refresh is the one place the loop is genuinely blind
+//! for ~14 ms, which is well inside what a host tolerates.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 
 use bao1x_hal::sh1107::{COLUMN, Mono, Oled128x128, ROW};
@@ -27,8 +40,8 @@ use crate::badgy::Badgy;
 use crate::gfx::{self, CHAR_HEIGHT};
 use crate::input::{ALL_KEYS, Key, KeySet, Keys};
 use crate::menu::{self, Action, ItemList, MenuDef, MenuView, ScriptList};
-use crate::platform::{self, delay_polled};
-use crate::runner::BadgeHost;
+use crate::platform;
+use crate::sched::{self, Ended, Status};
 use crate::scripts::Scripts;
 use crate::usb;
 use crate::util::{FmtBuf, hash3};
@@ -45,6 +58,11 @@ const SLOW_REFRESH_POLLS: u32 = 200;
 /// How long the wheel button has to be held on the drive screen to reformat.
 /// Longer than the button-test exit, because this one destroys files.
 const HOLD_FORMAT_POLLS: u16 = 400;
+/// Consecutive polls the leave-it-running chord must be held for. Two, because
+/// the UI's own debouncer has already filtered contact bounce by the time this
+/// sees it -- this is only guarding against catching one key of the chord a
+/// poll before the other.
+const UNFOCUS_HOLD: u8 = 2;
 
 /// Contrast is stored as a step index; the panel takes 0..=255.
 const BRIGHTNESS_STEPS: u8 = 16;
@@ -78,6 +96,10 @@ enum Screen {
     ScriptResult,
     /// Badgy's sprite sheet: one frame per detent of the wheel.
     Badgy,
+    /// A running script's page, presented whole. The keys belong to it.
+    ScriptView,
+    /// What is running, what it is costing, and how to stop it.
+    Tasks,
 }
 
 /// Which list a menu level is showing. Keeping the static tree as `&'static`
@@ -144,6 +166,15 @@ pub struct App {
     /// Which frame the sprite-sheet screen is showing.
     sheet: usize,
 
+    /// Cursor in the task manager, as a row index.
+    task_cursor: usize,
+    /// Consecutive polls the leave-it-running chord has been held.
+    unfocus_polls: u8,
+    /// Slots whose ending has already been reported. Without this the loop
+    /// would announce a finished background script on every pass until its row
+    /// was dismissed.
+    noticed: u8,
+
     perclk: u32,
 }
 
@@ -170,6 +201,9 @@ impl App {
             frame: 0,
             slow_polls: 0,
             sheet: 0,
+            task_cursor: 0,
+            unfocus_polls: 0,
+            noticed: 0,
             perclk,
         }
     }
@@ -184,6 +218,11 @@ impl App {
 
     /// Never returns: this is the whole firmware after bring-up.
     pub fn run(mut self, disp: &mut Oled128x128<'_>, keys: &mut Keys) -> ! {
+        // Claim slot 0 before anything can be spawned into the others. From
+        // here on this function is a task like any other -- it just happens to
+        // be the one that owns the screen.
+        sched::init();
+
         loop {
             usb::poll();
 
@@ -194,8 +233,14 @@ impl App {
                 self.dirty = true;
             }
 
+            self.reap_finished(keys);
+
             let fired = keys.poll();
-            if fired.any() {
+            if self.screen == Screen::ScriptView {
+                // The script has the keys. All this looks for is the chord that
+                // takes the screen back without stopping it.
+                self.watch_unfocus(keys);
+            } else if fired.any() {
                 self.badgy.poke();
                 self.on_keys(fired, disp, keys);
             }
@@ -208,7 +253,9 @@ impl App {
             // adding it to the animation set, where it would cost a 14 ms panel
             // refresh twenty times a second to show nothing new.
             self.slow_polls = self.slow_polls.wrapping_add(1);
-            if self.screen == Screen::UsbDrive && self.slow_polls % SLOW_REFRESH_POLLS == 0 {
+            if matches!(self.screen, Screen::UsbDrive | Screen::Tasks)
+                && self.slow_polls % SLOW_REFRESH_POLLS == 0
+            {
                 self.dirty = true;
             }
 
@@ -219,7 +266,19 @@ impl App {
                 self.dirty = true;
             }
 
-            if self.dirty {
+            if self.screen == Screen::ScriptView {
+                // Present a frame only when the script has one waiting. That
+                // handshake is also what paces the script: its `show()` blocks
+                // until this happens.
+                let tid = sched::focus();
+                if tid != sched::UI && sched::pending(tid) {
+                    sched::present(tid, disp);
+                    usb::poll();
+                    disp.draw().ok();
+                    usb::poll();
+                }
+                self.dirty = false;
+            } else if self.dirty {
                 self.dirty = false;
                 self.render(disp, keys);
                 usb::poll();
@@ -227,8 +286,78 @@ impl App {
                 usb::poll();
             }
 
-            delay_polled(POLL_MS, &mut usb::poll);
+            // Keep the loop's cadence, but spend the wait running scripts
+            // rather than spinning. With nothing else alive this is the busy
+            // poll it replaced, to the millisecond.
+            sched::pace(POLL_MS as u32);
         }
+    }
+
+    /// Notice tasks that have ended.
+    ///
+    /// A script that finishes in the background has nowhere to report to, so
+    /// this is where its result is picked up: the console line, Badgy's mood if
+    /// it crashed, and -- if it was the one on screen -- the result screen.
+    /// Finished slots are otherwise left alone, so the manager can show what
+    /// happened until the room is needed.
+    fn reap_finished(&mut self, keys: &mut Keys) {
+        for tid in 1..sched::MAX_TASKS {
+            if sched::status(tid) != Status::Done {
+                // Clears itself when the slot is reused, so a later task in the
+                // same slot is not mistaken for one already reported.
+                self.noticed &= !(1 << tid);
+                continue;
+            }
+            if self.noticed & (1 << tid) != 0 {
+                continue;
+            }
+            self.noticed |= 1 << tid;
+
+            let focused = sched::focus() == tid;
+            let outcome = match sched::ended(tid) {
+                Ended::Failed => Outcome::Failed(String::from(sched::message(tid))),
+                Ended::Stopped => Outcome::Stopped,
+                _ => Outcome::Finished,
+            };
+            if matches!(outcome, Outcome::Failed(_)) {
+                self.badgy.upset();
+            }
+
+            if focused {
+                self.last_script = String::from(sched::name(tid));
+                self.last_outcome = outcome;
+                // The script has been reading the matrix directly this whole
+                // time, so the UI's debouncer is stale -- and whatever key
+                // stopped it is probably still held. Adopt the current state
+                // rather than let it read as a press that dismisses the result
+                // screen instantly.
+                keys.resync();
+                sched::set_focus(sched::UI);
+                sched::reap(tid);
+                self.screen = Screen::ScriptResult;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// While a script is on screen, watch for the chord that takes the screen
+    /// back and leaves it running.
+    fn watch_unfocus(&mut self, keys: &mut Keys) {
+        let held = keys.held();
+        if !(held.has(Key::Left) && held.has(Key::Right)) {
+            self.unfocus_polls = 0;
+            return;
+        }
+        self.unfocus_polls = self.unfocus_polls.saturating_add(1);
+        if self.unfocus_polls < UNFOCUS_HOLD {
+            return;
+        }
+        self.unfocus_polls = 0;
+        sched::set_focus(sched::UI);
+        keys.resync();
+        self.screen = Screen::Tasks;
+        self.task_cursor = 0;
+        self.dirty = true;
     }
 
     /// The two screens where holding the wheel button does something, tracked
@@ -341,7 +470,15 @@ impl App {
                 // these are exclusive: activating and going back in the same
                 // poll would leave the stack somewhere nobody asked for.
                 if fired.has(Key::Select) || fired.has(Key::Center) || fired.has(Key::Right) {
-                    self.activate(disp, keys);
+                    // On the scripts list, RIGHT starts one without giving it
+                    // the screen. Everywhere else it is just another "select":
+                    // there is nothing else in the menu tree that could
+                    // meaningfully happen in the background.
+                    let background = fired.has(Key::Right)
+                        && !fired.has(Key::Select)
+                        && !fired.has(Key::Center)
+                        && self.showing_scripts();
+                    self.activate(background, disp, keys);
                 } else if fired.has(Key::Left) {
                     self.back();
                 }
@@ -395,6 +532,10 @@ impl App {
                 }
                 self.dirty = true;
             }
+            Screen::Tasks => self.on_task_keys(fired, keys),
+            // Handled in `watch_unfocus`, which runs instead of this: while a
+            // script is on screen every key is the script's.
+            Screen::ScriptView => (),
             Screen::SysInfo | Screen::About | Screen::ScriptResult => {
                 self.screen = Screen::Menu;
                 self.dirty = true;
@@ -402,7 +543,81 @@ impl App {
         }
     }
 
-    fn activate(&mut self, disp: &mut Oled128x128<'_>, keys: &mut Keys) {
+    /// The task manager's keys: wheel to pick a row, push to bring it to the
+    /// front, RIGHT to stop it (or to clear a finished one), LEFT to leave.
+    ///
+    /// RIGHT rather than a long hold, because the thing it does is already the
+    /// recovery action -- a hold-to-confirm on "stop the runaway script" would
+    /// be a confirmation prompt on the fire alarm.
+    fn on_task_keys(&mut self, fired: KeySet, keys: &mut Keys) {
+        // The list shrinks underneath the cursor whenever a task is reaped, so
+        // this is checked here rather than only where rows are removed.
+        let rows = self.task_rows();
+        if self.task_cursor >= rows {
+            self.task_cursor = rows - 1;
+        }
+        if fired.has(Key::Up) {
+            self.task_cursor = (self.task_cursor + rows - 1) % rows;
+            self.dirty = true;
+        }
+        if fired.has(Key::Down) {
+            self.task_cursor = (self.task_cursor + 1) % rows;
+            self.dirty = true;
+        }
+        let Some(tid) = self.task_at(self.task_cursor) else {
+            // The "Back" row. RIGHT here is the panic button: stop everything.
+            if fired.has(Key::Right) && sched::running() > 0 {
+                crate::println!("stopping every task");
+                sched::kill_all();
+                self.dirty = true;
+            } else if fired.has(Key::Select) || fired.has(Key::Center) || fired.has(Key::Left) {
+                self.screen = Screen::Menu;
+                self.dirty = true;
+            }
+            return;
+        };
+
+        if fired.has(Key::Left) {
+            self.screen = Screen::Menu;
+            self.dirty = true;
+        } else if fired.has(Key::Select) || fired.has(Key::Center) {
+            if sched::status(tid) == Status::Done {
+                // Nothing to look at, so show what happened instead.
+                self.last_script = String::from(sched::name(tid));
+                self.last_outcome = match sched::ended(tid) {
+                    Ended::Failed => Outcome::Failed(String::from(sched::message(tid))),
+                    Ended::Stopped => Outcome::Stopped,
+                    _ => Outcome::Finished,
+                };
+                sched::reap(tid);
+                self.screen = Screen::ScriptResult;
+            } else {
+                sched::set_focus(tid);
+                keys.resync();
+                self.screen = Screen::ScriptView;
+            }
+            self.dirty = true;
+        } else if fired.has(Key::Right) {
+            if sched::status(tid) == Status::Done {
+                sched::reap(tid);
+            } else {
+                crate::println!("task {}: stop requested", tid);
+                sched::kill(tid);
+            }
+            self.task_cursor = self.task_cursor.min(self.task_rows().saturating_sub(1));
+            self.dirty = true;
+        }
+    }
+
+    /// Rows in the manager: one per occupied slot, plus "Back".
+    fn task_rows(&self) -> usize { sched::occupied() + 1 }
+
+    /// The task a row points at, or `None` for the "Back" row.
+    fn task_at(&self, row: usize) -> Option<usize> {
+        (1..sched::MAX_TASKS).filter(|&t| sched::used(t)).nth(row)
+    }
+
+    fn activate(&mut self, background: bool, disp: &mut Oled128x128<'_>, keys: &mut Keys) {
         // Read the action out before doing anything: `with_list` borrows
         // `self`, and everything below needs it mutably.
         let cursor = self.view().cursor;
@@ -414,7 +629,11 @@ impl App {
         match action {
             Action::Submenu(def) => self.push(Src::Static(def)),
             Action::Scripts => self.push(Src::Scripts),
-            Action::RunScript(i) => self.run_script(i as usize, disp, keys),
+            Action::RunScript(i) => self.start_script(i as usize, !background, keys),
+            Action::Tasks => {
+                self.task_cursor = 0;
+                self.screen = Screen::Tasks;
+            }
             Action::UsbDrive => {
                 self.hold_polls = 0;
                 self.hold_armed = false;
@@ -476,54 +695,66 @@ impl App {
 
     // ---------------------------------------------------------------- scripts
 
-    /// Compile and run script `i`, then show how it went.
+    /// Compile script `i` and hand it to the scheduler.
     ///
-    /// The interpreter owns the screen and the keys while it runs; this returns
-    /// only when the script finishes, fails, or the user holds the exit chord.
-    fn run_script(&mut self, i: usize, disp: &mut Oled128x128<'_>, keys: &mut Keys) {
+    /// Compiling happens here, on the UI's stack, rather than inside the new
+    /// task: lexing and parsing hold the token vector and the AST at once and
+    /// peak near 250 KB, so keeping it out of the task means two of those peaks
+    /// never overlap -- and a syntax error is reported here and now, without a
+    /// task ever having existed.
+    ///
+    /// `focus` decides whether the script gets the screen. Either way it is a
+    /// task from the moment it starts; running one in the foreground is only
+    /// running one whose page is being presented.
+    fn start_script(&mut self, i: usize, focus: bool, keys: &mut Keys) {
         self.last_script = String::from(self.scripts.name(i));
-        crate::println!("running {}", self.last_script);
+        crate::println!("starting {}", self.last_script);
 
         let Some(src) = self.scripts.source(i) else {
-            self.last_outcome = Outcome::Failed(String::from("could not read the file"));
-            self.screen = Screen::ScriptResult;
+            self.fail_to_start("could not read the file");
             return;
         };
 
-        self.last_outcome = match pycon::Script::compile(&src) {
-            Err(e) => Outcome::Failed(alloc::format!("{}", e)),
-            Ok(script) => {
-                // Seed the script's random source from something that differs
-                // between runs. There is no clock and the TRNG is never powered
-                // up in this firmware, so the frame counter and the source
-                // length are what is available -- good enough for an animation,
-                // and documented as not cryptographic.
-                let seed = hash3(self.frame, src.len() as u32, self.scripts.generation);
-                let mut host = BadgeHost::new(disp, keys, seed);
-                match script.run(&mut host) {
-                    Ok(pycon::Completion::Finished) => Outcome::Finished,
-                    Ok(pycon::Completion::Aborted) => Outcome::Stopped,
-                    Err(e) => Outcome::Failed(alloc::format!("{}", e)),
-                }
+        let script = match pycon::Script::compile(&src) {
+            Ok(s) => s,
+            Err(e) => {
+                self.fail_to_start(&alloc::format!("{}", e));
+                return;
             }
         };
 
-        // The script has been reading the matrix directly this whole time, so
-        // the UI's debouncer is stale -- and whatever key stopped the script is
-        // probably still held. Adopt the current state rather than let it read
-        // as a press that dismisses the result screen instantly.
-        keys.resync();
+        // Seed the script's random source from something that differs between
+        // runs. There is no clock a script can read and the TRNG is never
+        // powered up in this firmware, so the frame counter, the source length
+        // and the millisecond count are what is available -- good enough for an
+        // animation, and documented as not cryptographic.
+        let seed = hash3(self.frame ^ platform::now_ms(), src.len() as u32, self.scripts.generation);
+        // The source is a large allocation and the new task does not need it --
+        // it holds the parsed form. Dropping it here keeps the peak down.
+        drop(src);
 
-        if matches!(self.last_outcome, Outcome::Failed(_)) {
-            self.badgy.upset();
+        match sched::spawn(self.scripts.name(i), Box::new(script), seed) {
+            Err(e) => self.fail_to_start(e.message()),
+            Ok(tid) => {
+                if focus {
+                    sched::set_focus(tid);
+                    keys.resync();
+                    self.screen = Screen::ScriptView;
+                } else {
+                    // Stay where we are, so a second script can be started from
+                    // the same list without walking back into it.
+                    self.dirty = true;
+                }
+            }
         }
+    }
 
-        match &self.last_outcome {
-            Outcome::Finished => crate::println!("{}: finished", self.last_script),
-            Outcome::Stopped => crate::println!("{}: stopped", self.last_script),
-            Outcome::Failed(m) => crate::println!("{}: {}", self.last_script, m),
-            Outcome::Note(m) => crate::println!("{}: {}", self.last_script, m),
-        }
+    /// A script that never got as far as being a task: unreadable, unparseable,
+    /// or nowhere to put it.
+    fn fail_to_start(&mut self, why: &str) {
+        crate::println!("{}: {}", self.last_script, why);
+        self.last_outcome = Outcome::Failed(String::from(why));
+        self.badgy.upset();
         self.screen = Screen::ScriptResult;
     }
 
@@ -572,6 +803,97 @@ impl App {
             Screen::UsbDrive => self.render_usb(fb),
             Screen::Badgy => self.render_badgy_sheet(fb),
             Screen::ScriptResult => self.render_result(fb),
+            Screen::Tasks => self.render_tasks(fb),
+            // Not drawn here at all: the compositor copies the focused task's
+            // page onto the panel instead. Reached only if a repaint is
+            // requested in the same pass as the switch to this screen.
+            Screen::ScriptView => (),
+        }
+    }
+
+    /// What is running, what it costs, and how to stop it.
+    fn render_tasks(&self, fb: &mut dyn FrameBuffer) {
+        let lit: ColorNative = Mono::White.into();
+        let dark: ColorNative = Mono::Black.into();
+        let mut buf = FmtBuf::<32>::new();
+
+        header(fb, "TASKS");
+        let mut y = CHAR_HEIGHT + 4;
+
+        for row in 0..self.task_rows() {
+            let selected = row == self.task_cursor;
+            let (fg, bg) = if selected { (dark, lit) } else { (lit, dark) };
+            if selected {
+                gfx::fill_rect(fb, Point::new(0, y), Point::new(COLUMN - 1, y + CHAR_HEIGHT - 1), lit);
+            }
+            match self.task_at(row) {
+                None => gfx::msg(fb, "Back", Point::new(4, y), fg, bg),
+                Some(tid) => {
+                    // Name, then status and cost in a fixed right-hand column,
+                    // so the numbers line up between rows and a long filename
+                    // cannot push them off the edge.
+                    let name = clip(sched::name(tid), 11);
+                    let text = buf.format(format_args!(
+                        "{:<11} {} {:>3}%",
+                        name,
+                        sched::status(tid).abbrev(),
+                        sched::cpu_percent(tid)
+                    ));
+                    gfx::msg(fb, text, Point::new(4, y), fg, bg);
+                }
+            }
+            y += CHAR_HEIGHT;
+        }
+
+        // Detail for the selected task, below the list. Two numbers worth
+        // seeing on real hardware rather than believing from a comment: how
+        // deep the stack has actually gone, and what is left of the shared
+        // heap.
+        y = ROW - CHAR_HEIGHT * 4 - 2;
+        match self.task_at(self.task_cursor) {
+            Some(tid) => {
+                if let Some((used, total)) = sched::stack_used(tid) {
+                    gfx::msg(
+                        fb,
+                        buf.format(format_args!("stack {:2}/{} KiB", used / 1024, total / 1024)),
+                        Point::new(3, y),
+                        lit,
+                        dark,
+                    );
+                }
+                y += CHAR_HEIGHT;
+                gfx::msg(
+                    fb,
+                    buf.format(format_args!("heap  {:3} KiB free", platform::heap_free() / 1024)),
+                    Point::new(3, y),
+                    lit,
+                    dark,
+                );
+                y += CHAR_HEIGHT;
+                let hint = if sched::status(tid) == Status::Done {
+                    "IN: result R: clear"
+                } else {
+                    "IN: view   R: stop"
+                };
+                gfx::msg(fb, hint, Point::new(3, y), lit, dark);
+            }
+            None => {
+                gfx::msg(
+                    fb,
+                    buf.format(format_args!("{} of {} slots used", sched::occupied(), sched::SCRIPT_SLOTS)),
+                    Point::new(3, y),
+                    lit,
+                    dark,
+                );
+                y += CHAR_HEIGHT;
+                gfx::msg(fb, "R in the script list", Point::new(3, y), lit, dark);
+                y += CHAR_HEIGHT;
+                gfx::msg(fb, "starts one hidden", Point::new(3, y), lit, dark);
+                y += CHAR_HEIGHT;
+                if sched::running() > 0 {
+                    gfx::msg(fb, "R here: stop all", Point::new(3, y), lit, dark);
+                }
+            }
         }
     }
 
@@ -592,6 +914,16 @@ impl App {
 
         let badger = self.badgy.sprite();
         gfx::sprite_centered(fb, badger, COLUMN, BADGY_TOP, lit, dark);
+
+        // A script running in the background is otherwise invisible from the
+        // home screen, which is where the badge spends most of its life. One
+        // glyph in the corner of the title band is enough to say so.
+        let live = sched::running();
+        if live > 0 {
+            let mut buf = FmtBuf::<8>::new();
+            let text = buf.format(format_args!("{}*", live));
+            gfx::msg(fb, text, Point::new(COLUMN - 2 * gfx::CHAR_WIDTH - 2, 2), lit, dark);
+        }
 
         // Caption on its own dark band, for the same reason as the title.
         let y = ROW - CHAR_HEIGHT - 3;
@@ -794,7 +1126,7 @@ impl App {
         line(fb, buf.format(format_args!("DISK   {:4} KiB", crate::usb::msc::DISK_BYTES / 1024)));
         line(fb, buf.format(format_args!("IMG  0x{:08x}", bao1x_api::BAREMETAL_START)));
         line(fb, buf.format(format_args!("PANEL  {}x{} 1bpp", COLUMN, ROW)));
-        line(fb, "KEYS   2x3 matrix");
+        line(fb, buf.format(format_args!("TASKS  {} of {} live", sched::running(), sched::SCRIPT_SLOTS)));
         line(fb, "");
         line(fb, "any key: back");
     }
@@ -805,16 +1137,17 @@ impl App {
 
         header(fb, "ABOUT");
         let mut y = 16;
+        // Nine lines is what fits below the title bar. Anything added here has
+        // to displace something.
         for text in [
             "BadgyOS + pycon",
-            "baremetal firmware",
             "for the DC34 badge",
             "",
-            "wheel = scroll",
-            "push  = select",
-            "left  = back",
+            "wheel scroll, push",
+            "select, left back",
+            "right runs hidden",
+            "L+C stops, L+R hides",
             "",
-            "L+C stops a script",
             "dev-signed: no k0",
         ] {
             gfx::msg(fb, text, Point::new(3, y), lit, dark);

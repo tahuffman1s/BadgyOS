@@ -4,6 +4,8 @@
 //! only what is needed to have a working clock, timer, heap, console and OLED:
 //! no interrupts, no USB, no BIO, no camera/keyboard/flash, no TRNG.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use bao1x_api::*;
 use bao1x_hal::iox::Iox;
 use utralib::CSR;
@@ -188,35 +190,69 @@ pub fn heap_free() -> usize { ALLOCATOR.lock().free() }
 /// script off the drive.
 pub const HEAP_RESERVE: usize = 192 * 1024;
 
+// ------------------------------------------------------------- the ms counter
+
+/// Milliseconds since [`setup_timer`], as counted by whoever polls the timer.
+static MILLIS: AtomicU32 = AtomicU32::new(0);
+
+/// Advance the millisecond counter if timer0 has rolled over since the last
+/// look, and hand back the current count.
+///
+/// # Why this has to be the only reader
+///
+/// timer0 is a 1 ms auto-reload with a *sticky one-bit* event flag: reading it
+/// tells you at least one millisecond has passed, and acknowledging it throws
+/// away however many actually did. That was fine when the firmware had one
+/// loop, because whoever was spinning on the flag was also the only thing that
+/// cared about the answer. With several tasks it is a bug waiting to happen --
+/// two of them spinning on the same flag would each see about half the
+/// milliseconds, and every `sleep()` would silently run long.
+///
+/// So the flag has exactly one meaning now: it belongs to this counter, and
+/// everything that wants to know the time asks here. [`delay`] still consumes
+/// it directly -- it is the bring-up path, and it runs before there is anything
+/// to share with -- so it feeds the counter as it goes rather than stealing
+/// from it.
+///
+/// # What it costs in accuracy
+///
+/// A millisecond is lost whenever more than one elapses between two calls. In
+/// practice that is the panel refresh -- ~14 ms of blocking SPI, the one place
+/// this firmware is genuinely blind -- so a `sleep()` that spans a redraw reads
+/// short by about that much. Everything else calls this far more often than
+/// once a millisecond: it is on the scheduler's switch path, so every task's
+/// tick is also a clock read.
+pub fn tick_clock() -> u32 {
+    let mut timer = CSR::new(utra::timer0::HW_TIMER0_BASE as *mut u32);
+    if timer.rf(utra::timer0::EV_PENDING_ZERO) != 0 {
+        timer.wfo(utra::timer0::EV_PENDING_ZERO, 1);
+        return MILLIS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    }
+    MILLIS.load(Ordering::Relaxed)
+}
+
+/// The millisecond count as of the last [`tick_clock`], without touching the
+/// hardware. Wraps after 49 days; compare with `wrapping_sub`.
+pub fn now_ms() -> u32 { MILLIS.load(Ordering::Relaxed) }
+
+/// Has `ms` milliseconds passed since `start`? Written this way so callers do
+/// not have to remember that the counter wraps.
+pub fn elapsed(start: u32, ms: u32) -> bool { now_ms().wrapping_sub(start) >= ms }
+
 /// Delay a given number of milliseconds. Requires `setup_timer()` first.
 ///
-/// Nothing else runs while this spins. Once USB is up, prefer
-/// [`delay_polled`] -- a device that stops answering for a whole delay is a
-/// device the host starts to doubt.
+/// Nothing else runs while this spins -- not even USB, and not other tasks,
+/// because it does not yield. It is for bring-up, before there is a scheduler
+/// to yield to. From a task use `sched::nap`, which spends the wait on whatever
+/// else wants to run and keeps the controller serviced throughout; a device
+/// that stops answering for a whole delay is a device the host starts to doubt.
 pub fn delay(ms: usize) {
     let mut timer = CSR::new(utra::timer0::HW_TIMER0_BASE as *mut u32);
     timer.wfo(utra::timer0::EV_PENDING_ZERO, 1);
     for _ in 0..ms {
         while timer.rf(utra::timer0::EV_PENDING_ZERO) == 0 {}
         timer.wfo(utra::timer0::EV_PENDING_ZERO, 1);
-    }
-}
-
-/// Like [`delay`], but runs `f` while it waits.
-///
-/// This is how the USB controller gets serviced during every pause in the
-/// firmware. The callback runs in the inner busy-wait rather than once per
-/// millisecond, so the controller is polled thousands of times per millisecond
-/// -- which costs one register read each and keeps the worst-case service gap
-/// down to whatever the *caller* does between delays.
-pub fn delay_polled(ms: usize, f: &mut dyn FnMut()) {
-    let mut timer = CSR::new(utra::timer0::HW_TIMER0_BASE as *mut u32);
-    timer.wfo(utra::timer0::EV_PENDING_ZERO, 1);
-    for _ in 0..ms {
-        while timer.rf(utra::timer0::EV_PENDING_ZERO) == 0 {
-            f();
-        }
-        timer.wfo(utra::timer0::EV_PENDING_ZERO, 1);
+        MILLIS.fetch_add(1, Ordering::Relaxed);
     }
 }
 

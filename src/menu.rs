@@ -35,8 +35,11 @@ pub enum Action {
     Badgy,
     /// Open the list of scripts found on the USB drive.
     Scripts,
-    /// Run the script at this index in that list.
+    /// Run the script at this index in that list. Whether it gets the screen
+    /// is decided by which key was pressed, not by the item.
     RunScript(u8),
+    /// What is running right now, and how to stop it.
+    Tasks,
     /// The USB drive status screen.
     UsbDrive,
     /// Pop a level; at the root, return to the splash screen.
@@ -102,6 +105,7 @@ pub static MAIN: MenuDef = MenuDef {
     title: "BadgyOS",
     items: &[
         MenuItem { label: "Scripts", action: Action::Scripts },
+        MenuItem { label: "Tasks", action: Action::Tasks },
         MenuItem { label: "USB Drive", action: Action::UsbDrive },
         MenuItem { label: "Demos", action: Action::Submenu(&DEMOS) },
         MenuItem { label: "Button Test", action: Action::KeyTest },

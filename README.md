@@ -12,14 +12,14 @@ that runs them on the badge.
 ```
    home screen                menu                     scripts
   +------------------+  +------------------+     +------------------+
-  |     BadgyOS      |  |#    BadgyOS     #|     |#    SCRIPTS     #|
+  |     BadgyOS   1* |  |#    BadgyOS     #|     |#    SCRIPTS     #|
   | 0 F+  ,--. >= V  |  |>Scripts          |     |>blink.py         |
-  |  D  ( oo )  - +  |  | USB Drive        |     | bounce.py        |
-  |   N> `-vv-' <N   |  | Demos            |     | hello.py         |
-  |  +---(    )---+  |  | Button Test      |     | my cool script~  |
-  |  E   |uuuu|   %  |  | Display          |     | Back             |
-  |                  |  | System Info      |     |                  |
-  |  -PUSH WHEEL-    |  | Badgy            |     |                  |
+  |  D  ( oo )  - +  |  | Tasks            |     | bounce.py        |
+  |   N> `-vv-' <N   |  | USB Drive        |     | hello.py         |
+  |  +---(    )---+  |  | Demos            |     | my cool script~  |
+  |  E   |uuuu|   %  |  | Button Test      |     | Back             |
+  |                  |  | Display          |     |                  |
+  |  -PUSH WHEEL-    |  | System Info      |     |                  |
   +------------------+  +------------------+     +------------------+
        128x128 SH1107, 21x10 characters of 6x12 font
 ```
@@ -27,8 +27,8 @@ that runs them on the badge.
 | | |
 |---|---|
 | **Target** | DEF CON 34 badge core module (baosec-lite class), Baochip‑1x SoC |
-| **Shape** | `no_std` + `alloc`, single-threaded, no interrupts, one polling loop |
-| **Image** | one signed `badgyos.uf2`, 820 UF2 blocks (205 KiB of ReRAM) |
+| **Shape** | `no_std` + `alloc`, no interrupts, one loop passed between cooperative tasks |
+| **Image** | one signed `badgyos.uf2`, 845 UF2 blocks (211 KiB of ReRAM) |
 | **Language** | `pycon` — a Python subset in 4.2 kLOC, zero dependencies |
 | **Tested** | 127 host tests over the language and the filesystem |
 | **Warning** | flashing it **destroys your badge's `k0` permanently** — [read this](#read-this-before-flashing) |
@@ -192,15 +192,30 @@ The badge's side wheel is a Haoyu TS-1513B: a one-dimensional directional switch
 with a center press. Rolling it and pressing it are three separate contacts in
 the same 2×3 matrix as the three face buttons.
 
-| Input | Menu | Home screen | Demo | Button test | USB drive | Badgy |
-|---|---|---|---|---|---|---|
-| wheel roll | move cursor | open menu | exit | — | — | next frame |
-| wheel press | select | open menu | exit | hold 1s to exit | hold 2s to format | back |
-| left button | back | open menu | exit | — | back | back |
-| center / right | select | open menu | exit | — | back | back |
+| Input | Menu | Home screen | Demo | Button test | USB drive | Badgy | Tasks |
+|---|---|---|---|---|---|---|---|
+| wheel roll | move cursor | open menu | exit | — | — | next frame | move cursor |
+| wheel press | select | open menu | exit | hold 1s to exit | hold 2s to format | back | view / result |
+| left button | back | open menu | exit | — | back | back | back |
+| center | select | open menu | exit | — | back | back | view / result |
+| right | select | open menu | exit | — | back | back | stop / clear |
 
-While a script runs it owns the screen and the keys; **LEFT + CENTER** takes them
-back.
+In the **scripts** list, wheel-press and center run a script in front of you;
+**right** starts it in the background instead. Either way it is a task — running
+one in the foreground only means its page is the one on screen.
+
+While a script is on screen it owns the keys, so the two ways out are chords:
+
+| Chord | What it does |
+|---|---|
+| **LEFT + CENTER** | stop the script (held ~3 ticks; the script sees it too) |
+| **LEFT + RIGHT** | leave it running and go to **Tasks** |
+
+**Tasks** lists what is running, with its state, its share of the CPU, and — for
+the row under the cursor — how deep its stack has been and what is left of the
+heap. **Right** on a running task stops it, on a finished one clears the row, and
+on the **Back** row stops everything. The home screen shows `n*` in the corner
+when `n` scripts are running behind it.
 
 ---
 
@@ -216,8 +231,9 @@ back.
 | light-genetics / QR breeding game | gone (and `k0` with it) |
 | composite CDC + mass-storage USB | mass storage + HID mouse, polled |
 | camera, accelerometer, TRNG, BIO | never initialized |
-| interrupts, threads | none — one polling loop |
-| 690 UF2 blocks (loader alone) | **820 UF2 blocks** |
+| interrupts | none — one polling loop |
+| preemptive threads, MMU-isolated | 4 cooperative tasks, one address space |
+| 690 UF2 blocks (loader alone) | **845 UF2 blocks** |
 
 What is left: reset vector, clock/PLL bring-up, a timer, a transmit-only serial
 console, the SH1107 driver, a polled key matrix, an 864-byte bitmap font, a USB
@@ -244,7 +260,8 @@ src/
   input.rs      jog wheel + buttons: 2x3 matrix scan, debounce, auto-repeat
   anim.rs       ASCII animations: matrix rain, doom fire, plasma
   menu.rs       scrolling list widget, the static menu tree, the ItemList seam
-  app.rs        screen state machine and the polling loop
+  sched.rs      green threads: the context switch, task table, pages, kill
+  app.rs        screen state machine, the polling loop, and the compositor
   usb/
     mod.rs      attach / poll / reattach, the SE0 dance, pointer window checks
     proto.rs    descriptors and EP0 control transfers
@@ -528,6 +545,89 @@ and ReRAM persistence across a power cycle. Windows and macOS have not been trie
 at all — keep `VOL_LBA_BASE` parameterized in case one of them needs the MBR
 wrapper.
 
+**Also not yet verified on hardware: the scheduler.** It builds, it packages, and
+the 127 host tests still pass — but none of them exercise a context switch,
+because the switch is assembly for a target the test bench does not run. What to
+watch for on a badge, in the order they would show up: whether the first switch
+into a fresh task lands in the trampoline at all (a wrong `ra` offset or a stack
+that is not 16-byte aligned would trap straight to `abort`, i.e. a screen full of
+`u` on the DUART); whether `Tasks` shows a plausible stack high-water mark
+(48 KiB was reasoned about, not measured — the manager exists to replace the
+reasoning with a number); and whether a backgrounded animation keeps the same
+speed it had in front, which is the `FRAME_MS` pacing doing its job.
+
+---
+
+## Running more than one script
+
+Up to three scripts run at once, each on its own stack, switched by hand. The
+whole kernel is `src/sched.rs` — a task table, twenty-five instructions of
+assembly, and the rule about who gets the screen.
+
+```
+        the loop, handed around
+   +----------+   yield   +----------+   yield   +----------+
+   | task 0   | --------> | blink.py | --------> | jiggle.py|
+   | the UI   | <-------------------------------------------+
+   +----------+
+   draws to the panel        each draws into its own 2 KiB page
+```
+
+**Why cooperative and not preemptive.** Cooperative scheduling normally has one
+fatal flaw — a task that never yields wedges the machine, and `while True: pass`
+is a legal pycon program. That flaw does not exist here, because the interpreter
+already yields on a cadence *it* controls rather than one the script controls:
+`Interp::steps` calls `Host::tick` every 512 statements whatever those statements
+are, and every blocking builtin (`sleep`, `wait_key`, `show`) funnels through the
+same place. A pycon script cannot fail to reach a scheduling point. Preemption
+would buy only the ability to reap a task wedged in *Rust*, and would cost
+putting the allocator's spin lock, `usb::poll()` and the ReRAM commit sequence
+within reach of reentrancy — the same trade this firmware already refused when it
+chose to poll the USB controller instead of taking its interrupt.
+
+**The switch.** Push `ra` and `s0`–`s11`, store `sp` in the outgoing task, load
+`sp` from the incoming one, pop, return. Everything else is caller-saved and
+there is no float state on rv32imac. A new task's stack is hand-built with a
+frame whose return address is the trampoline, so the first switch into it
+"returns" into a task that has never run.
+
+**Nobody draws to the panel.** There is one OLED and there can be three scripts,
+so each task draws into its own 128×128 page and the UI task copies whichever one
+has focus onto glass. That is what makes the task manager a screen-switcher, and
+it means `show()` no longer blocks on 14 ms of SPI — so it is *made* to cost 14 ms
+anyway, spent on other tasks, or every backgrounded animation would silently run
+an order of magnitude fast.
+
+**Stopping one is not a `kill(2).`** Nothing tears a task's stack down from
+outside. `sched::kill` sets a flag that the interpreter's existing abort path
+reads, so the script unwinds exactly as it does for the exit chord: values freed,
+`Drop` run, and any mouse button it was holding released. Reaping a stack instead
+would leak every one of those. The cost is that a task wedged below the
+interpreter — which pycon cannot arrange, but a bug in a builtin could — is not
+killable at all, and that is the honest price of the design.
+
+**The bug this design had to be built around:** timer0 is a 1 ms auto-reload with
+a *sticky, one-bit* event flag. Acknowledging it throws away however many
+milliseconds actually passed. With one loop that was harmless — whoever spun on
+the flag was also the only thing that cared. With three tasks it silently halves
+everyone's clock and every `sleep()` runs long. So the flag now has exactly one
+reader (`platform::tick_clock`) and everything else asks it for the time.
+
+Other things that had to be shared out, and how:
+
+| | |
+|---|---|
+| the keys | only the focused task sees them; the rest read an empty matrix |
+| the mouse and USB identity | one bus, so first task to ask keeps them; others get `False`, which the API could already say |
+| the heap | not partitioned. 768 KiB between three scripts, and whoever crosses `HEAP_RESERVE` is the one that fails |
+| the stacks | 48 KiB each in `.bss`, with a poisoned kilobyte at the bottom probed on every switch — under three tasks, running off the end would corrupt a *neighbour*, so it stops the task with "ran out of stack" instead |
+| the allocator | its lock is never held across a switch, because switches happen only where `sched` puts them and none is inside `alloc`. True of cooperative scheduling, false of preemption |
+
+What it costs: 96 KiB more `.bss` (688 KiB total, still 592 KiB clear under the
+boot stack), 25 UF2 blocks, and about thirty instructions per switch. What is
+unchanged: `pycon` itself, which needed no modification at all — the `Host` trait
+was already the right seam — so all 127 host tests still run on a laptop.
+
 ---
 
 ## Notes on the implementation
@@ -571,13 +671,14 @@ wrapper.
   odd one out: it drives a FET gate rather than shorting its row to its column,
   but it still reads at `(row 1, col 2)`.
 
-- **Timing is counted in polls and frames, not milliseconds.** A full `draw()`
+- **UI timing is counted in polls and frames, not milliseconds.** A full `draw()`
   pushes 2 KiB over a 2 MHz SPI and costs roughly three polls, and timer0 is a
   1 ms auto-reload with a *sticky, one-bit* event flag — so a millisecond clock
   polled from the render loop silently loses every tick spent drawing. Debounce,
   key repeat, the animation cadence, the hold-to-exit and Badgy's blink are all
   in loop iterations or animation frames instead, which is a unit the loop can
-  actually measure.
+  actually measure. The scheduler does keep a millisecond count, because `sleep()`
+  and the CPU meter need one — it has the same blind spot, and says so.
 
 - **The heap's start is derived, not hardcoded.** It is 256 KiB placed
   immediately above the region `early_init` zeroizes, read from the statics table
@@ -604,8 +705,9 @@ wrapper.
   The cost is latency. The longest the loop goes without polling is one
   `Oled128x128::draw()`, about 14 ms, which is inside the 50 ms a host allows for
   `SET_ADDRESS` and irrelevant to bulk traffic — an unserviced bulk transfer is
-  NAKed and retried, which is ordinary USB. Every delay runs through
-  `platform::delay_polled()`, so that 14 ms really is the worst case.
+  NAKed and retried, which is ordinary USB. Every wait in the firmware runs
+  through `sched::yield_now()`, which polls the controller on the way past, so
+  that 14 ms really is the worst case no matter which task is busy.
 
 - **The drive is a real filesystem, not boot1's trick.** boot1 never stores what
   the host writes: it sniffs the sector stream for UF2 magic and discards the

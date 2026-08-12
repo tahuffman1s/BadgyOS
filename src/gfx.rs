@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+use bao1x_hal::sh1107::{COLUMN, ROW};
 use ux_api::minigfx::*;
 
 // This font is from the embedded-graphics crate,
@@ -211,4 +212,93 @@ pub fn stroke_rect(fb: &mut dyn FrameBuffer, tl: Point, br: Point, color: ColorN
         fb.put_pixel(Point::new(tl.x, y), color);
         fb.put_pixel(Point::new(br.x, y), color);
     }
+}
+
+// ------------------------------------------------------------ off-screen page
+
+/// Words in one 128x128 1bpp page. The panel is 2 KiB, which is small enough
+/// that every task can have its own.
+pub const FB_WORDS: usize = (COLUMN * ROW) as usize / 32;
+
+/// An off-screen copy of the panel.
+///
+/// # Why every task draws into one of these
+///
+/// There is one OLED and there can be several scripts. Handing them all a
+/// `&mut Oled128x128` is not expressible and would not be right anyway: two
+/// scripts drawing into the same page would interleave into garbage. So nobody
+/// draws to the panel. Each task draws here, and the compositor -- the UI task,
+/// which is the only thing that ever touches the hardware -- copies whichever
+/// page is in focus onto glass with [`Oled128x128::blit_screen`].
+///
+/// The bit layout is deliberately the driver's own (`bitnum = x + y * COLUMN`,
+/// LSB first, and the panel's inverted polarity where a *cleared* bit is lit),
+/// so presenting a page is a 2 KiB `copy_from_slice` and not a conversion.
+///
+/// This costs a memcpy per presented frame -- about 15 us against the 14 ms the
+/// panel refresh itself takes, so it is not a cost worth avoiding.
+pub struct Fb {
+    words: [u32; FB_WORDS],
+}
+
+impl Fb {
+    /// An *unusable* page, for building the static table only.
+    ///
+    /// Zeros rather than the all-ones a blank page actually is, and that is not
+    /// a bug: every non-zero word of a `static` becomes an entry in the image's
+    /// poke table, which holds 40 and would need 1536 for three all-ones pages.
+    /// Zero keeps the table in `.bss`, where it costs nothing in the image and
+    /// nothing at boot. Pages are blanked with `clear()` when a task takes one,
+    /// which is the only point at which the contents could matter -- and on
+    /// this panel a zero bit is a *lit* pixel, so a page that skipped that step
+    /// would come up white.
+    pub const NEW: Fb = Fb { words: [0; FB_WORDS] };
+
+    pub fn words(&self) -> &[u32; FB_WORDS] { &self.words }
+}
+
+impl FrameBuffer for Fb {
+    fn put_pixel(&mut self, p: Point, color: ColorNative) {
+        if p.x >= COLUMN || p.y >= ROW || p.x < 0 || p.y < 0 {
+            return;
+        }
+        // safety: the bounds check above is exactly `put_pixel_unchecked`'s
+        // requirement.
+        unsafe { self.put_pixel_unchecked(p, color) }
+    }
+
+    #[inline(always)]
+    unsafe fn put_pixel_unchecked(&mut self, p: Point, color: ColorNative) {
+        let bitnum = (p.x + p.y * COLUMN) as usize;
+        if color.0 != 0 {
+            self.words[bitnum >> 5] |= 1 << (bitnum & 0x1f);
+        } else {
+            self.words[bitnum >> 5] &= !(1 << (bitnum & 0x1f));
+        }
+    }
+
+    fn get_pixel(&self, p: Point) -> Option<ColorNative> {
+        if p.x >= COLUMN || p.y >= ROW || p.x < 0 || p.y < 0 {
+            return None;
+        }
+        let bitnum = (p.x + p.y * COLUMN) as usize;
+        if self.words[bitnum >> 5] & 1 << (bitnum & 0x1f) != 0 { Some(1.into()) } else { Some(0.into()) }
+    }
+
+    fn xor_pixel(&mut self, p: Point) {
+        if let Some(px) = self.get_pixel(p) {
+            self.put_pixel(p, ColorNative(if px.0 != 0 { 0 } else { 1 }));
+        }
+    }
+
+    /// A no-op, and not an oversight: a page reaches the panel when the
+    /// compositor presents it, not when its owner asks. `Host::gfx_show` is
+    /// what marks the page ready -- see [`crate::sched::present`].
+    fn draw(&mut self) -> Result<(), xous::Error> { Ok(()) }
+
+    fn clear(&mut self) { self.words.fill(0xffff_ffff); }
+
+    fn dimensions(&self) -> Point { Point::new(COLUMN, ROW) }
+
+    unsafe fn raw_mut(&mut self) -> &mut ux_api::platform::FbRaw { &mut self.words }
 }

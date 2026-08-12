@@ -1,14 +1,19 @@
 //! BadgyOS -- a small, scriptable DEF CON 34 badge firmware, with a badger.
 //!
 //! Everything the stock image does is gone: no Xous kernel, no processes, no
-//! swap, no PDDB, no FIDO2/TOTP/vault, no LED genetics. This is a
-//! single-threaded, no_std program that boot1 jumps straight into.
+//! swap, no PDDB, no FIDO2/TOTP/vault, no LED genetics. This is a no_std program
+//! with no interrupts that boot1 jumps straight into.
 //!
 //! It brings up the clock tree, the console UART, the SH1107 OLED, the key
 //! matrix and a USB mass-storage device, then runs a jog-wheel-driven UI: a home
 //! screen with Badgy on it, a menu of demos and diagnostics, and -- the point of
 //! the exercise -- a list of `pycon` scripts that were dragged onto the badge's
 //! USB drive.
+//!
+//! Those scripts run as cooperative tasks, up to three at once, each on its own
+//! stack and drawing into its own page: see [`sched`]. That is the one place
+//! this firmware is not the single polling loop it started as -- and it is still
+//! one loop, handed around.
 //!
 //! ```text
 //!   host  --USB MSC-->  RAM disk  --FAT12-->  scripts  --interpreter-->  panel
@@ -34,6 +39,7 @@ mod input;
 mod menu;
 mod platform;
 mod runner;
+mod sched;
 mod scripts;
 mod sprites;
 mod store;

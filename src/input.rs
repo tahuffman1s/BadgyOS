@@ -32,6 +32,8 @@
 //! (`kpc_sr0_to_key`, bit positions 4/5/6 for row 1) agrees with the netlist:
 //! SW5 is Left, SW3 is Right, SW4 is Center. That is what we use.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use bao1x_api::{IoSetup, IoxDir, IoxDriveStrength, IoxEnable, IoxFunction, IoxPort, IoxValue};
 use bao1x_hal::iox::Iox;
 use utralib::utra;
@@ -143,7 +145,13 @@ impl Keys {
     }
 
     /// Mirror up/down and left/right, to match a vertically flipped panel.
-    pub fn set_flipped(&mut self, flipped: bool) { self.flipped = flipped; }
+    pub fn set_flipped(&mut self, flipped: bool) {
+        self.flipped = flipped;
+        // Script tasks read the matrix through the free function below, which
+        // does not have a `Keys` to ask, so the orientation is also kept where
+        // anyone can see it.
+        FLIPPED.store(flipped, Ordering::Relaxed);
+    }
 
     /// Adopt the current physical state as the debounced state, without
     /// reporting anything as newly pressed.
@@ -154,23 +162,14 @@ impl Keys {
     /// script exited looks like a fresh press to the very next `poll()`, and
     /// the screen the script left behind is dismissed before it can be read.
     pub fn resync(&mut self) {
-        let raw = self.scan();
+        let raw = scan(&self.iox);
         self.stable = raw;
         self.last_raw = raw;
         self.held_polls = [0; KEY_COUNT];
     }
 
     /// Keys physically held right now, debounced.
-    pub fn held(&self) -> KeySet { KeySet(self.remap(self.stable)) }
-
-    /// One undebounced sample of the matrix, for callers that are not the UI.
-    ///
-    /// A running script polls the keys far more often than the UI does, and
-    /// [`Keys::poll`] counts its debounce and auto-repeat in calls -- so
-    /// letting the interpreter drive it would make `REPEAT_DELAY` mean
-    /// something different depending on how busy the script was, and the menu
-    /// would feel different after running one. This leaves that state alone.
-    pub fn scan_raw(&self) -> u8 { self.remap(self.scan()) }
+    pub fn held(&self) -> KeySet { KeySet(remap(self.stable, self.flipped)) }
 
     /// Sample the matrix once and return the keys that "fired" -- pressed since
     /// the last poll, or repeating because they are being held.
@@ -178,7 +177,7 @@ impl Keys {
     /// Call this on a steady cadence; the debounce and the repeat timing are
     /// both counted in calls, not in milliseconds.
     pub fn poll(&mut self) -> KeySet {
-        let raw = self.scan();
+        let raw = scan(&self.iox);
         let mut fired = 0u8;
 
         // A sample only counts once it has been seen twice running. The switches
@@ -211,44 +210,72 @@ impl Keys {
             }
         }
 
-        KeySet(self.remap(fired))
+        KeySet(remap(fired, self.flipped))
     }
+}
 
-    /// One full pass over the matrix. Returns a raw, un-remapped bitmask.
-    fn scan(&self) -> u8 {
-        let mut mask = 0u8;
-        for (row_idx, row_pin) in ROW_PINS.iter().enumerate() {
-            self.iox.set_gpio_pin(KB_PORT, *row_pin, IoxValue::Low);
-            settle();
-            // One bank read picks up all three columns at the same instant.
-            let bank = self.iox.get_gpio_bank(KB_PORT);
-            self.iox.set_gpio_pin(KB_PORT, *row_pin, IoxValue::High);
+/// Panel orientation, for readers that do not hold the [`Keys`] that owns it.
+static FLIPPED: AtomicBool = AtomicBool::new(false);
 
-            for (col_idx, col_pin) in COL_PINS.iter().enumerate() {
-                if bank & (1 << col_pin) == 0 {
-                    mask |= 1 << (row_idx * COL_PINS.len() + col_idx);
-                }
+/// One undebounced sample of the matrix, for callers that are not the UI.
+///
+/// A running script polls the keys far more often than the UI does, and
+/// [`Keys::poll`] counts its debounce and auto-repeat in calls -- so letting the
+/// interpreter drive it would make `REPEAT_DELAY` mean something different
+/// depending on how busy the script was, and the menu would feel different
+/// after running one. This leaves that state alone.
+///
+/// A free function rather than a method because several tasks read the keys and
+/// there is only one `Keys`: passing a `&mut` to it down every script's stack
+/// would be a lie about who owns the debouncer. Nothing here is stateful -- the
+/// pins were configured by [`Keys::new`] and an `Iox` is a wrapped pointer -- so
+/// several readers see the same matrix and nothing else.
+///
+/// A scan is not, however, safe to interleave: it drives one row low, waits,
+/// and reads the columns, so a second scan starting in the middle of the first
+/// would read a row nobody selected. Nothing in [`scan`] yields and the
+/// scheduler only switches where something yields, so no two scans can overlap.
+/// That is a real invariant and not an accident -- if a `settle()` ever grows a
+/// yield to be polite, this breaks.
+pub fn scan_raw() -> u8 {
+    let iox = Iox::new(utra::iox::HW_IOX_BASE as *mut u32);
+    remap(scan(&iox), FLIPPED.load(Ordering::Relaxed))
+}
+
+/// One full pass over the matrix. Returns a raw, un-remapped bitmask.
+fn scan(iox: &Iox) -> u8 {
+    let mut mask = 0u8;
+    for (row_idx, row_pin) in ROW_PINS.iter().enumerate() {
+        iox.set_gpio_pin(KB_PORT, *row_pin, IoxValue::Low);
+        settle();
+        // One bank read picks up all three columns at the same instant.
+        let bank = iox.get_gpio_bank(KB_PORT);
+        iox.set_gpio_pin(KB_PORT, *row_pin, IoxValue::High);
+
+        for (col_idx, col_pin) in COL_PINS.iter().enumerate() {
+            if bank & (1 << col_pin) == 0 {
+                mask |= 1 << (row_idx * COL_PINS.len() + col_idx);
             }
         }
-        mask
     }
+    mask
+}
 
-    fn remap(&self, mask: u8) -> u8 {
-        if !self.flipped {
-            return mask;
-        }
-        let swap = |m: u8, a: Key, b: Key| -> u8 {
-            let mut out = m & !(a.bit() | b.bit());
-            if m & a.bit() != 0 {
-                out |= b.bit();
-            }
-            if m & b.bit() != 0 {
-                out |= a.bit();
-            }
-            out
-        };
-        swap(swap(mask, Key::Up, Key::Down), Key::Left, Key::Right)
+fn remap(mask: u8, flipped: bool) -> u8 {
+    if !flipped {
+        return mask;
     }
+    let swap = |m: u8, a: Key, b: Key| -> u8 {
+        let mut out = m & !(a.bit() | b.bit());
+        if m & a.bit() != 0 {
+            out |= b.bit();
+        }
+        if m & b.bit() != 0 {
+            out |= a.bit();
+        }
+        out
+    };
+    swap(swap(mask, Key::Up, Key::Down), Key::Left, Key::Right)
 }
 
 /// Let a column settle after its row driver changes.
