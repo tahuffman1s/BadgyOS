@@ -29,6 +29,27 @@ fi
 XOUS_CORE="$(cd "${HERE}/vendor/xous-core" && pwd -P)"
 
 TARGET=riscv32imac-unknown-none-elf
+
+# The triple the *host tools* have to be built for, stated rather than left to
+# the config, because leaving it to the config is a trap that only springs in
+# CI.
+#
+# `.cargo/config.toml` here sets `build.target` to the riscv triple so that a
+# bare `cargo build` does the right thing. Cargo discovers that file by walking
+# up from the working directory -- and when `vendor/xous-core` is a real
+# directory rather than a symlink out of the tree, `cd`ing into it to build
+# xous-copy-object is still *inside* this repo. So the walk finds our config,
+# the host tools get built for a bare-metal riscv target, and the first thing
+# that notices is `getrandom` failing with "can't find crate std".
+#
+# It works on a developer's machine because bootstrap.sh prefers to symlink an
+# existing checkout, and `pwd -P` above resolves that symlink to somewhere
+# outside this tree. CI has no checkout to adopt, so it clones into vendor/ and
+# hits the nested case every time. An explicit --target beats an inherited
+# `build.target`, and does so in both arrangements.
+HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+[[ -n "${HOST_TRIPLE}" ]] || { echo "build: cannot determine the host triple from rustc -vV" >&2; exit 1; }
+
 OUTDIR="${HERE}/target/${TARGET}/release"
 ELF="${OUTDIR}/badgyos"
 PRESIGN="${OUTDIR}/badgyos-presign.img"
@@ -47,9 +68,10 @@ cargo build --release --target "${TARGET}"
 
 echo "==> 2/3 copy-object (flat image + statics)"
 # These are host tools living in the xous-core workspace; run them from there so
-# they pick up that workspace's cargo config rather than ours.
+# they pick up that workspace's rustflags rather than ours -- but pin the target
+# explicitly, for the reason spelled out where HOST_TRIPLE is set.
 cd "${XOUS_CORE}"
-cargo run --release --package xous-tools --bin xous-copy-object -- \
+cargo run --release --target "${HOST_TRIPLE}" --package xous-tools --bin xous-copy-object -- \
     "${ELF}" "${PRESIGN}" --bao1x
 
 # The statics header carries the two limits that are easy to blow through without
@@ -76,7 +98,7 @@ if heap + HEAP_LEN >= RAM_TOP:
 PY
 
 echo "==> 3/3 sign (developer key) + uf2"
-cargo run --release --package xous-tools --bin xous-sign-image -- \
+cargo run --release --target "${HOST_TRIPLE}" --package xous-tools --bin xous-sign-image -- \
     --loader-image "${PRESIGN}" \
     --loader-key "${SIGNING_KEY}" \
     --loader-output "${IMG}" \
