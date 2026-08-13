@@ -18,7 +18,7 @@ members = [".", "pycon", "badgy-fat"]
 
 [package]
 name = "badgyos"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # Apache-2.0, matching xous-core: gfx.rs, the font, platform.rs, link.x and
 # build.rs are derived from that tree.
