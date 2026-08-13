@@ -74,6 +74,17 @@ pub enum Builtin {
     UsbPid,
     UsbId,
     UsbName,
+    // badge: the USB keyboard
+    KbdReady,
+    KeyPress,
+    KeyRelease,
+    KeyReleaseAll,
+    KeyTap,
+    KeyMod,
+    KeyOf,
+    Type,
+    KbdLeds,
+    DetectOs,
     // badge: the badger
     Sprite,
     BadgyArt,
@@ -116,6 +127,16 @@ impl Builtin {
             "usb_pid" => Builtin::UsbPid,
             "usb_id" => Builtin::UsbId,
             "usb_name" => Builtin::UsbName,
+            "kbd_ready" => Builtin::KbdReady,
+            "key_press" => Builtin::KeyPress,
+            "key_release" => Builtin::KeyRelease,
+            "key_release_all" => Builtin::KeyReleaseAll,
+            "key_tap" => Builtin::KeyTap,
+            "key_mod" => Builtin::KeyMod,
+            "key_of" => Builtin::KeyOf,
+            "type" => Builtin::Type,
+            "kbd_leds" => Builtin::KbdLeds,
+            "detect_os" => Builtin::DetectOs,
             "sprite" => Builtin::Sprite,
             "badgy_art" => Builtin::BadgyArt,
             "badgy" => Builtin::BadgyDraw,
@@ -143,6 +164,50 @@ pub fn constant(name: &str) -> Option<Value> {
         "MOUSE_MAX" => Value::Int(host::MOUSE_MAX_STEP),
         "USB_VID" => Value::Int(host::USB_VID_DEFAULT as i32),
         "USB_PID" => Value::Int(host::USB_PID_DEFAULT as i32),
+        // keyboard modifiers, lock LEDs, OS-detection results and named keys
+        "MOD_CTRL" => Value::Int(host::MOD_CTRL as i32),
+        "MOD_SHIFT" => Value::Int(host::MOD_SHIFT as i32),
+        "MOD_ALT" => Value::Int(host::MOD_ALT as i32),
+        "MOD_GUI" => Value::Int(host::MOD_GUI as i32),
+        "MOD_RCTRL" => Value::Int(host::MOD_RCTRL as i32),
+        "MOD_RSHIFT" => Value::Int(host::MOD_RSHIFT as i32),
+        "MOD_RALT" => Value::Int(host::MOD_RALT as i32),
+        "MOD_RGUI" => Value::Int(host::MOD_RGUI as i32),
+        "LED_NUM" => Value::Int(host::LED_NUM as i32),
+        "LED_CAPS" => Value::Int(host::LED_CAPS as i32),
+        "LED_SCROLL" => Value::Int(host::LED_SCROLL as i32),
+        "OS_UNKNOWN" => Value::Int(host::OS_UNKNOWN),
+        "OS_WINDOWS" => Value::Int(host::OS_WINDOWS),
+        "OS_LINUX" => Value::Int(host::OS_LINUX),
+        "OS_MAC" => Value::Int(host::OS_MAC),
+        "KEY_ENTER" => Value::Int(host::KEY_ENTER),
+        "KEY_ESC" => Value::Int(host::KEY_ESC),
+        "KEY_BACKSPACE" => Value::Int(host::KEY_BACKSPACE),
+        "KEY_TAB" => Value::Int(host::KEY_TAB),
+        "KEY_SPACE" => Value::Int(host::KEY_SPACE),
+        "KEY_CAPSLOCK" => Value::Int(host::KEY_CAPSLOCK),
+        "KEY_F1" => Value::Int(host::KEY_F1),
+        "KEY_F2" => Value::Int(host::KEY_F2),
+        "KEY_F3" => Value::Int(host::KEY_F3),
+        "KEY_F4" => Value::Int(host::KEY_F4),
+        "KEY_F5" => Value::Int(host::KEY_F5),
+        "KEY_F6" => Value::Int(host::KEY_F6),
+        "KEY_F7" => Value::Int(host::KEY_F7),
+        "KEY_F8" => Value::Int(host::KEY_F8),
+        "KEY_F9" => Value::Int(host::KEY_F9),
+        "KEY_F10" => Value::Int(host::KEY_F10),
+        "KEY_F11" => Value::Int(host::KEY_F11),
+        "KEY_F12" => Value::Int(host::KEY_F12),
+        "KEY_INSERT" => Value::Int(host::KEY_INSERT),
+        "KEY_HOME" => Value::Int(host::KEY_HOME),
+        "KEY_PAGEUP" => Value::Int(host::KEY_PAGEUP),
+        "KEY_DELETE" => Value::Int(host::KEY_DELETE),
+        "KEY_END" => Value::Int(host::KEY_END),
+        "KEY_PAGEDOWN" => Value::Int(host::KEY_PAGEDOWN),
+        "KEY_RIGHT_ARROW" => Value::Int(host::KEY_RIGHT_ARROW),
+        "KEY_LEFT_ARROW" => Value::Int(host::KEY_LEFT_ARROW),
+        "KEY_DOWN_ARROW" => Value::Int(host::KEY_DOWN_ARROW),
+        "KEY_UP_ARROW" => Value::Int(host::KEY_UP_ARROW),
         "BADGY_AUTO" => Value::Int(host::BADGY_AUTO),
         "BADGY_IDLE" => Value::Int(host::BADGY_IDLE),
         "BADGY_BLINK" => Value::Int(host::BADGY_BLINK),
@@ -193,6 +258,111 @@ fn button_mask(name: &str, v: i32) -> Result<u8, Fault> {
         )));
     }
     Ok(v as u8)
+}
+
+/// Validate a HID keycode. These are 8-bit usage numbers on the wire, so a
+/// value that does not fit is a mistake worth naming rather than truncating into
+/// a different key.
+fn keycode_arg(name: &str, args: &[Value], i: usize) -> Result<u8, Fault> {
+    let v = int_arg(name, args, i)?;
+    if !(0..=0xff).contains(&v) {
+        return Err(bad(alloc::format!("{}() keycode must be between 0 and 255, got {}", name, v)));
+    }
+    Ok(v as u8)
+}
+
+/// Validate a modifier mask. All eight bits are defined modifiers, so any byte
+/// is legal; this just bounds it to a byte so a stray high bit is caught rather
+/// than silently dropped.
+fn mod_mask_arg(name: &str, args: &[Value], i: usize) -> Result<u8, Fault> {
+    let v = int_arg(name, args, i)?;
+    if !(0..=0xff).contains(&v) {
+        return Err(bad(alloc::format!("{}() modifier mask must be between 0 and 255, got {}", name, v)));
+    }
+    Ok(v as u8)
+}
+
+/// Map a printable US-ASCII byte to its HID keycode and whether Shift is needed.
+///
+/// `None` for a byte with no key on a US layout -- control characters other than
+/// tab and newline, and anything non-ASCII. `type()` skips those; `key_of()`
+/// turns them into an error the script can see.
+///
+/// The layout is fixed US because the keyboard advertises no country code, so
+/// what a character produces is whatever the *host's* layout maps these usages
+/// to. On a non-US host the letters and digits still land; some punctuation will
+/// not. That is a property of HID, not a bug to work around here.
+fn ascii_to_hid(c: u8) -> Option<(u8, bool)> {
+    Some(match c {
+        b'a'..=b'z' => (0x04 + (c - b'a'), false),
+        b'A'..=b'Z' => (0x04 + (c - b'A'), true),
+        b'1'..=b'9' => (0x1E + (c - b'1'), false),
+        b'0' => (0x27, false),
+        b'\n' => (0x28, false), // Enter
+        b'\t' => (0x2B, false), // Tab
+        b' ' => (0x2C, false),
+        b'-' => (0x2D, false),
+        b'_' => (0x2D, true),
+        b'=' => (0x2E, false),
+        b'+' => (0x2E, true),
+        b'[' => (0x2F, false),
+        b'{' => (0x2F, true),
+        b']' => (0x30, false),
+        b'}' => (0x30, true),
+        b'\\' => (0x31, false),
+        b'|' => (0x31, true),
+        b';' => (0x33, false),
+        b':' => (0x33, true),
+        b'\'' => (0x34, false),
+        b'"' => (0x34, true),
+        b'`' => (0x35, false),
+        b'~' => (0x35, true),
+        b',' => (0x36, false),
+        b'<' => (0x36, true),
+        b'.' => (0x37, false),
+        b'>' => (0x37, true),
+        b'/' => (0x38, false),
+        b'?' => (0x38, true),
+        b'!' => (0x1E, true),
+        b'@' => (0x1F, true),
+        b'#' => (0x20, true),
+        b'$' => (0x21, true),
+        b'%' => (0x22, true),
+        b'^' => (0x23, true),
+        b'&' => (0x24, true),
+        b'*' => (0x25, true),
+        b'(' => (0x26, true),
+        b')' => (0x27, true),
+        _ => return None,
+    })
+}
+
+/// Type a US-ASCII string one key at a time, holding Shift only across the runs
+/// that need it rather than toggling it per character. Returns whether the
+/// keystrokes reached a host -- false if nothing was listening.
+///
+/// Press and release are separate reports and the firmware waits for the host
+/// to collect the press before sending the release, so no two keystrokes are
+/// ever coalesced into one poll: the host sees every character.
+fn type_string(host: &mut dyn Host, text: &str) -> Result<bool, Fault> {
+    let mut ok = true;
+    let mut cur_mod = 0u8;
+    for c in text.bytes() {
+        let Some((code, shift)) = ascii_to_hid(c) else { continue };
+        let want = if shift { host::MOD_SHIFT as u8 } else { 0 };
+        if want != cur_mod {
+            host.kbd_modifiers(want)?;
+            cur_mod = want;
+        }
+        ok &= host.kbd_key(code, true)?;
+        ok &= host.kbd_key(code, false)?;
+    }
+    // Drop Shift if a capital or symbol left it held, so the keyboard is not
+    // left with a modifier down after the string is typed.
+    if cur_mod != 0 {
+        host.kbd_modifiers(0)?;
+    }
+    Ok(ok)
 }
 
 /// Validate a badger frame id: a mood, a slot, or [`host::SPRITE_NONE`].
@@ -594,6 +764,78 @@ pub fn call(b: Builtin, args: &[Value], host: &mut dyn Host) -> R {
             arity("usb_name", args, 1, 1)?;
             let name = str_arg("usb_name", args, 0)?;
             Ok(Value::Bool(host.usb_set_name(name)?))
+        }
+
+        // -------------------------------------------------------- usb keyboard
+        Builtin::KbdReady => {
+            arity("kbd_ready", args, 0, 0)?;
+            Ok(Value::Bool(host.kbd_ready()))
+        }
+        Builtin::KeyPress => {
+            arity("key_press", args, 1, 2)?;
+            let code = keycode_arg("key_press", args, 0)?;
+            // An optional modifier mask goes down first, so `key_press(code,
+            // MOD_CTRL)` holds Ctrl with the key. The key stays down until a
+            // matching key_release or key_release_all.
+            if args.len() == 2 {
+                let mods = mod_mask_arg("key_press", args, 1)?;
+                host.kbd_modifiers(mods)?;
+            }
+            Ok(Value::Bool(host.kbd_key(code, true)?))
+        }
+        Builtin::KeyRelease => {
+            arity("key_release", args, 1, 1)?;
+            let code = keycode_arg("key_release", args, 0)?;
+            Ok(Value::Bool(host.kbd_key(code, false)?))
+        }
+        Builtin::KeyReleaseAll => {
+            arity("key_release_all", args, 0, 0)?;
+            Ok(Value::Bool(host.kbd_release_all()?))
+        }
+        Builtin::KeyMod => {
+            arity("key_mod", args, 1, 1)?;
+            let mods = mod_mask_arg("key_mod", args, 0)?;
+            Ok(Value::Bool(host.kbd_modifiers(mods)?))
+        }
+        Builtin::KeyTap => {
+            arity("key_tap", args, 1, 2)?;
+            let code = keycode_arg("key_tap", args, 0)?;
+            // Press with the modifiers held, release, then drop the modifiers --
+            // the whole of a keystroke or a chord in one call. `key_tap(key_of("r"),
+            // MOD_GUI)` is Win+R; `key_tap(KEY_DELETE, MOD_CTRL | MOD_ALT)` is
+            // Ctrl+Alt+Del.
+            let mods = if args.len() == 2 { mod_mask_arg("key_tap", args, 1)? } else { 0 };
+            if mods != 0 {
+                host.kbd_modifiers(mods)?;
+            }
+            let down = host.kbd_key(code, true)?;
+            let up = host.kbd_key(code, false)?;
+            if mods != 0 {
+                host.kbd_modifiers(0)?;
+            }
+            Ok(Value::Bool(down && up))
+        }
+        Builtin::KeyOf => {
+            arity("key_of", args, 1, 1)?;
+            let s = str_arg("key_of", args, 0)?;
+            let c = s.bytes().next().ok_or_else(|| bad("key_of() needs a non-empty string"))?;
+            match ascii_to_hid(c) {
+                Some((code, _)) => Ok(Value::Int(code as i32)),
+                None => Err(bad(alloc::format!("key_of() has no US-layout key for {:?}", c as char))),
+            }
+        }
+        Builtin::Type => {
+            arity("type", args, 1, 1)?;
+            let text = str_arg("type", args, 0)?;
+            Ok(Value::Bool(type_string(host, text)?))
+        }
+        Builtin::KbdLeds => {
+            arity("kbd_leds", args, 0, 0)?;
+            Ok(Value::Int(host.kbd_leds() as i32))
+        }
+        Builtin::DetectOs => {
+            arity("detect_os", args, 0, 0)?;
+            Ok(Value::Int(host.detect_os()?))
         }
 
         // --------------------------------------------------------- the badger

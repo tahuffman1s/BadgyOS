@@ -49,6 +49,72 @@ pub const MOUSE_MAX_STEP: i32 = 127;
 pub const USB_VID_DEFAULT: u16 = 0x1d50;
 pub const USB_PID_DEFAULT: u16 = 0x6199;
 
+// ------------------------------------------------------------------ keyboard
+//
+// The badge can also present itself as a USB keyboard, and the script side of
+// it is these constants plus the `key_*` / `type` builtins. Modifier and LED
+// values are the bits of the HID keyboard report, so the firmware passes them
+// through without translating; the keycodes are HID usage numbers, so a script
+// can name a key the `type()` table does not cover (a function key, an arrow).
+
+/// Modifier bits, matching the HID keyboard report's modifier byte so a script
+/// can OR them into a chord: `key_tap(key_of("c"), MOD_CTRL)` is Ctrl+C.
+/// `MOD_GUI` is the Windows / Command key.
+pub const MOD_CTRL: u32 = 1 << 0;
+pub const MOD_SHIFT: u32 = 1 << 1;
+pub const MOD_ALT: u32 = 1 << 2;
+pub const MOD_GUI: u32 = 1 << 3;
+pub const MOD_RCTRL: u32 = 1 << 4;
+pub const MOD_RSHIFT: u32 = 1 << 5;
+pub const MOD_RALT: u32 = 1 << 6;
+pub const MOD_RGUI: u32 = 1 << 7;
+
+/// Lock-LED bits, as `kbd_leds()` reports them -- the state the host pushes down
+/// to the keyboard, which is the one thing it says back.
+pub const LED_NUM: u32 = 1 << 0;
+pub const LED_CAPS: u32 = 1 << 1;
+pub const LED_SCROLL: u32 = 1 << 2;
+
+/// What `detect_os()` returns. `OS_UNKNOWN` is also "no host", so a script that
+/// runs on the bench still gets a defined answer.
+pub const OS_UNKNOWN: i32 = 0;
+pub const OS_WINDOWS: i32 = 1;
+pub const OS_LINUX: i32 = 2;
+pub const OS_MAC: i32 = 3;
+
+/// A handful of non-printing HID keycodes worth naming. Printable characters go
+/// through `type()` and do not need a constant; these are the keys that have no
+/// character to type. The arrow keys carry an `_ARROW` suffix so they do not
+/// collide with the badge's own `KEY_UP` / `KEY_LEFT` d-pad bits.
+pub const KEY_ENTER: i32 = 0x28;
+pub const KEY_ESC: i32 = 0x29;
+pub const KEY_BACKSPACE: i32 = 0x2A;
+pub const KEY_TAB: i32 = 0x2B;
+pub const KEY_SPACE: i32 = 0x2C;
+pub const KEY_CAPSLOCK: i32 = 0x39;
+pub const KEY_F1: i32 = 0x3A;
+pub const KEY_F2: i32 = 0x3B;
+pub const KEY_F3: i32 = 0x3C;
+pub const KEY_F4: i32 = 0x3D;
+pub const KEY_F5: i32 = 0x3E;
+pub const KEY_F6: i32 = 0x3F;
+pub const KEY_F7: i32 = 0x40;
+pub const KEY_F8: i32 = 0x41;
+pub const KEY_F9: i32 = 0x42;
+pub const KEY_F10: i32 = 0x43;
+pub const KEY_F11: i32 = 0x44;
+pub const KEY_F12: i32 = 0x45;
+pub const KEY_INSERT: i32 = 0x49;
+pub const KEY_HOME: i32 = 0x4A;
+pub const KEY_PAGEUP: i32 = 0x4B;
+pub const KEY_DELETE: i32 = 0x4C;
+pub const KEY_END: i32 = 0x4D;
+pub const KEY_PAGEDOWN: i32 = 0x4E;
+pub const KEY_RIGHT_ARROW: i32 = 0x4F;
+pub const KEY_LEFT_ARROW: i32 = 0x50;
+pub const KEY_DOWN_ARROW: i32 = 0x51;
+pub const KEY_UP_ARROW: i32 = 0x52;
+
 // -------------------------------------------------------------------- the badger
 //
 // The badge has a mascot, and a script can both draw him and take him over. One
@@ -238,6 +304,54 @@ pub trait Host {
         let _ = name;
         Ok(false)
     }
+
+    // ---------------------------------------------------------------- keyboard
+    //
+    // The badge as a USB keyboard. Like the mouse, every method defaults to
+    // "there is no keyboard here", so a host without one -- the test bench, a
+    // build without the HID interface -- needs no code to say so, and a script
+    // written against these still runs to the end.
+
+    /// Is there a host that would receive keystrokes? False before the badge is
+    /// plugged in, or while nothing has configured the keyboard interface.
+    fn kbd_ready(&mut self) -> bool { false }
+
+    /// Press (`down == true`) or release one key by its HID keycode, and report
+    /// the change. Keycodes 0xE0..=0xE7 are the modifiers; everything else is an
+    /// ordinary key. The full set of held keys is remembered, so this is how
+    /// N-key rollover happens: press three keys, and all three are in the report.
+    ///
+    /// Returns whether the report reached a host. `Ok(false)` when nothing is
+    /// listening is the ordinary answer, not an error.
+    fn kbd_key(&mut self, code: u8, down: bool) -> Result<bool, Abort> {
+        let _ = (code, down);
+        Ok(false)
+    }
+
+    /// Set which modifiers are held, as a mask of the `MOD_*` constants, without
+    /// disturbing the other keys, and report it. Separate from [`Host::kbd_key`]
+    /// so a chord can hold Shift or Ctrl across several keystrokes.
+    fn kbd_modifiers(&mut self, mask: u8) -> Result<bool, Abort> {
+        let _ = mask;
+        Ok(false)
+    }
+
+    /// Release every key and modifier, and report it. The clean slate a script
+    /// wants before it starts and the firmware forces when it ends, so a killed
+    /// script cannot leave the host believing a key is still down.
+    fn kbd_release_all(&mut self) -> Result<bool, Abort> { Ok(false) }
+
+    /// The lock LEDs the host last pushed down, as a mask of the `LED_*`
+    /// constants. This is the readback -- the state a host reports for Num, Caps
+    /// and Scroll lock -- and it is what the Caps Lock OS-detection trick reads.
+    fn kbd_leds(&mut self) -> u32 { 0 }
+
+    /// Best-effort guess at the host's operating system, as one of the `OS_*`
+    /// constants, using the Caps Lock LED trick: toggle a lock key and watch how
+    /// the host echoes the change. Heuristic -- see the firmware for what each
+    /// answer is inferred from -- so a script should treat `OS_UNKNOWN` as "could
+    /// not tell", which is also what a host with no keyboard returns.
+    fn detect_os(&mut self) -> Result<i32, Abort> { Ok(OS_UNKNOWN) }
 
     // ------------------------------------------------------------- the badger
     //

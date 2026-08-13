@@ -17,6 +17,7 @@ const BOUNCE: &str = include_str!("../../samples/bounce.py");
 const KEYS: &str = include_str!("../../samples/keys.py");
 const JIGGLE: &str = include_str!("../../samples/jiggle.py");
 const USBID: &str = include_str!("../../samples/usbid.py");
+const KEYBOARD: &str = include_str!("../../samples/keyboard.py");
 
 /// A host that answers like a badge with a key held down, and gives up after a
 /// bounded number of ticks.
@@ -257,6 +258,20 @@ fn keys_py_compiles_and_yields() {
 }
 
 #[test]
+fn keyboard_py_compiles_and_yields() {
+    // Like keys.py, keyboard.py is a screen with no exit of its own, so the
+    // check is that it parses -- including `detect_os()` at the top, which runs
+    // on the null keyboard here -- and yields regularly. Driven with a key that
+    // is not CENTER so it stays on the status path rather than trying to type.
+    let script =
+        Script::compile(KEYBOARD).unwrap_or_else(|e| panic!("keyboard.py does not compile: {}", e));
+    let mut host = Bench::new(pycon::host::KEY_UP);
+    host.limit = 2000;
+    assert_eq!(script.run(&mut host).unwrap(), Completion::Aborted);
+    assert!(host.ticks > 100, "keyboard.py should yield regularly, saw {} ticks", host.ticks);
+}
+
+#[test]
 fn jiggle_py_moves_the_mouse_when_a_host_is_listening() {
     // Like keys.py it runs until the chord stops it, so the assertions are
     // about what it did on the way: it should nudge immediately rather than
@@ -398,7 +413,7 @@ fn the_samples_only_use_documented_builtins() {
     // the first thing a user copies will not be reproducible from what they
     // were told.
     const README: &str = include_str!("../../samples/readme.txt");
-    const ALL: [&str; 5] = [HELLO, BOUNCE, KEYS, JIGGLE, USBID];
+    const ALL: [&str; 6] = [HELLO, BOUNCE, KEYS, JIGGLE, USBID, KEYBOARD];
     for name in [
         "clear",
         "pixel",
@@ -424,6 +439,16 @@ fn the_samples_only_use_documented_builtins() {
         "usb_pid",
         "usb_id",
         "usb_name",
+        "kbd_ready",
+        "type",
+        "key_of",
+        "key_tap",
+        "key_press",
+        "key_release",
+        "key_release_all",
+        "key_mod",
+        "kbd_leds",
+        "detect_os",
         "sprite",
         "badgy_art",
         "badgy",
@@ -450,6 +475,12 @@ fn the_samples_only_use_documented_builtins() {
         "MOUSE_MAX",
         "USB_VID",
         "USB_PID",
+        "LED_NUM",
+        "LED_CAPS",
+        "LED_SCROLL",
+        "MOD_CTRL",
+        "MOD_GUI",
+        "OS_UNKNOWN",
         "BADGY_AUTO",
         "BADGY_IDLE",
         "BADGY_BLINK",
@@ -467,4 +498,174 @@ fn the_samples_only_use_documented_builtins() {
             assert!(README.contains(konst), "samples use {} but readme.txt does not mention it", konst);
         }
     }
+}
+
+// --------------------------------------------------------------- keyboard API
+//
+// The keyboard builtins map a script's intent onto host calls -- `type` picks
+// keycodes and holds Shift, `key_tap` wraps a chord -- and that mapping is
+// worth pinning down exactly. `KeyRec` is a host that records every keyboard
+// call as a line, so a test can assert the precise sequence a script produces.
+// (The report *packing* -- the NKRO bitmap, the boot-report fallback -- lives
+// in the firmware's `usb::kbd`, which is `no_std` and cannot run here.)
+
+#[derive(Default)]
+struct KeyRec {
+    inner: NullHost,
+    ready: bool,
+    leds: u32,
+    os: i32,
+    /// One line per keyboard call the script made.
+    events: Vec<String>,
+    /// The modifier byte last set, echoed into each key line so a test can see
+    /// which modifiers a keystroke was sent under.
+    mods: u8,
+}
+
+impl Host for KeyRec {
+    fn tick(&mut self) -> Result<(), Abort> { Ok(()) }
+
+    fn print_line(&mut self, s: &str) { self.inner.print_line(s); }
+
+    fn gfx_clear(&mut self) {}
+
+    fn gfx_pixel(&mut self, _x: i32, _y: i32, _on: bool) {}
+
+    fn gfx_text(&mut self, _x: i32, _y: i32, _s: &str, _on: bool) {}
+
+    fn gfx_rect(&mut self, _a: i32, _b: i32, _c: i32, _d: i32, _f: bool) {}
+
+    fn gfx_line(&mut self, _a: i32, _b: i32, _c: i32, _d: i32) {}
+
+    fn gfx_show(&mut self) -> Result<(), Abort> { Ok(()) }
+
+    fn keys(&mut self) -> u32 { 0 }
+
+    fn wait_key(&mut self) -> Result<u32, Abort> { Err(Abort) }
+
+    fn sleep_ms(&mut self, _ms: u32) -> Result<(), Abort> { Ok(()) }
+
+    fn random(&mut self) -> u32 { 0 }
+
+    fn kbd_ready(&mut self) -> bool { self.ready }
+
+    fn kbd_key(&mut self, code: u8, down: bool) -> Result<bool, Abort> {
+        let dir = if down { "down" } else { "up" };
+        self.events.push(format!("{} {:#04x} m{:#04x}", dir, code, self.mods));
+        Ok(self.ready)
+    }
+
+    fn kbd_modifiers(&mut self, mask: u8) -> Result<bool, Abort> {
+        self.mods = mask;
+        self.events.push(format!("mod {:#04x}", mask));
+        Ok(self.ready)
+    }
+
+    fn kbd_release_all(&mut self) -> Result<bool, Abort> {
+        self.mods = 0;
+        self.events.push(String::from("release_all"));
+        Ok(self.ready)
+    }
+
+    fn kbd_leds(&mut self) -> u32 { self.leds }
+
+    fn detect_os(&mut self) -> Result<i32, Abort> { Ok(self.os) }
+}
+
+fn run_keys(src: &str, host: &mut KeyRec) {
+    let script = Script::compile(src).unwrap_or_else(|e| panic!("{} does not compile: {}", src, e));
+    assert_eq!(script.run(host).unwrap(), Completion::Finished);
+}
+
+/// The recorded lines as `&str`, so a test can compare against a plain literal
+/// list rather than one built out of `String::from`.
+fn ev(host: &KeyRec) -> Vec<&str> { host.events.iter().map(String::as_str).collect() }
+
+#[test]
+fn type_maps_ascii_and_holds_shift_only_across_the_runs_that_need_it() {
+    let mut host = KeyRec { ready: true, ..Default::default() };
+    run_keys("type('Hi!')", &mut host);
+    // H is Shift+0x0b, i is 0x0c, ! is Shift+0x1e. Shift goes down once for H,
+    // comes off for i, back on for !, and is dropped at the end -- not toggled
+    // per character.
+    assert_eq!(ev(&host), vec![
+        "mod 0x02", // Shift, for H
+        "down 0x0b m0x02",
+        "up 0x0b m0x02",
+        "mod 0x00", // Shift off, for i
+        "down 0x0c m0x00",
+        "up 0x0c m0x00",
+        "mod 0x02", // Shift on again, for !
+        "down 0x1e m0x02",
+        "up 0x1e m0x02",
+        "mod 0x00", // dropped at the end
+    ]);
+}
+
+#[test]
+fn type_skips_characters_with_no_us_key_but_keeps_going() {
+    let mut host = KeyRec { ready: true, ..Default::default() };
+    // A carriage return has no key of its own (only newline maps, to Enter); a
+    // and b straddle it and must still be typed. Nothing is left holding Shift,
+    // so there is no trailing mod-clear.
+    run_keys("type('a\\rb')", &mut host);
+    assert_eq!(ev(&host), vec![
+        "down 0x04 m0x00",
+        "up 0x04 m0x00",
+        "down 0x05 m0x00",
+        "up 0x05 m0x00",
+    ]);
+}
+
+#[test]
+fn key_tap_wraps_a_chord_in_one_call() {
+    let mut host = KeyRec { ready: true, ..Default::default() };
+    // Win+R: key_of('r') is 0x15, MOD_GUI is 0x08. Modifiers down, key tapped
+    // under them, modifiers back off.
+    run_keys("key_tap(key_of('r'), MOD_GUI)", &mut host);
+    assert_eq!(ev(&host), vec![
+        "mod 0x08",
+        "down 0x15 m0x08",
+        "up 0x15 m0x08",
+        "mod 0x00",
+    ]);
+}
+
+#[test]
+fn key_tap_without_modifiers_leaves_the_modifier_byte_alone() {
+    let mut host = KeyRec { ready: true, ..Default::default() };
+    // No modifier argument means no modifier reports at all -- just the tap.
+    run_keys("key_tap(KEY_ENTER)", &mut host);
+    assert_eq!(ev(&host), vec!["down 0x28 m0x00", "up 0x28 m0x00"]);
+}
+
+#[test]
+fn keys_can_be_held_together_for_rollover() {
+    let mut host = KeyRec { ready: true, ..Default::default() };
+    // Three presses with no release between them: the API never forces a key
+    // up, which is what lets the firmware report all three at once.
+    run_keys("key_press(4)\nkey_press(5)\nkey_press(6)", &mut host);
+    assert_eq!(ev(&host), vec!["down 0x04 m0x00", "down 0x05 m0x00", "down 0x06 m0x00"]);
+}
+
+#[test]
+fn detect_os_and_led_readback_reach_the_script() {
+    let mut host = KeyRec {
+        ready: true,
+        os: pycon::host::OS_LINUX,
+        leds: pycon::host::LED_CAPS,
+        ..Default::default()
+    };
+    run_keys("print(detect_os())\nprint(kbd_leds())", &mut host);
+    // OS_LINUX is 2, LED_CAPS is 2. The script sees both as plain ints.
+    assert_eq!(host.inner.output, vec![String::from("2"), String::from("2")]);
+}
+
+#[test]
+fn keycode_out_of_range_is_a_named_error() {
+    let mut host = KeyRec { ready: true, ..Default::default() };
+    let script = Script::compile("key_tap(300)").unwrap();
+    // 300 does not fit the 8-bit keycode field, so it is refused rather than
+    // truncated into some other key.
+    assert!(script.run(&mut host).is_err());
 }

@@ -58,6 +58,16 @@ const WAIT_STEP_MS: u32 = 2;
 const MOUSE_WAIT_STEPS: u32 = 32;
 const MOUSE_WAIT_STEP_MS: u32 = 2;
 
+/// How long the OS-detection probe waits for the host to echo a lock-LED change
+/// after a Caps Lock tap, and how often it looks. 400 ms is well past the
+/// round trip a host that is going to answer takes (a few poll intervals), so a
+/// full timeout is a real "no echo" rather than an impatient one -- which is the
+/// signal that separates macOS from the rest.
+const OS_PROBE_MS: u32 = 400;
+const OS_PROBE_STEP_MS: u32 = 2;
+/// The Caps Lock HID keycode, the one lock key the probe toggles.
+const CAPSLOCK_KEYCODE: u8 = 0x39;
+
 /// The task holding the HID mouse and the USB identity, or 0 for nobody.
 ///
 /// These are the two things a task cannot be given a private copy of: there is
@@ -135,6 +145,11 @@ pub struct BadgeHost {
     /// USB module because it is script state: a move has to carry the buttons
     /// that were already down, or every drag would drop halfway through.
     buttons: u8,
+    /// Whether this task has pressed any key. Unlike the mouse buttons, the
+    /// keyboard's held-key state lives in the USB module (the report is a
+    /// bitmap, not a byte), so this is just the flag that says "there may be
+    /// something to release on the way out".
+    kbd_active: bool,
 }
 
 impl BadgeHost {
@@ -147,6 +162,7 @@ impl BadgeHost {
             last_raw: 0,
             stopped: false,
             buttons: 0,
+            kbd_active: false,
         }
     }
 
@@ -179,6 +195,99 @@ impl BadgeHost {
             sched::nap(MOUSE_WAIT_STEP_MS);
         }
         Ok(false)
+    }
+
+    /// Queue the keyboard's current report, waiting for the interrupt endpoint
+    /// to drain first, exactly as [`Self::report`] does for the mouse.
+    ///
+    /// The wait is load-bearing for typing: the release is not queued until the
+    /// host has collected the press, so no two keystrokes are ever coalesced
+    /// into a single poll and every character registers.
+    fn kbd_send(&mut self) -> Result<bool, Abort> {
+        if !claim_usb(self.tid) {
+            return Ok(false);
+        }
+        self.kbd_active = true;
+        for _ in 0..MOUSE_WAIT_STEPS {
+            self.service()?;
+            if !usb::kbd::is_ready() {
+                return Ok(false);
+            }
+            if usb::kbd::send() {
+                return Ok(true);
+            }
+            sched::nap(MOUSE_WAIT_STEP_MS);
+        }
+        Ok(false)
+    }
+
+    /// Best-effort OS fingerprint via the Caps Lock LED trick.
+    ///
+    /// The mechanism is sound; the classification is a heuristic, and the two
+    /// deserve to be told apart:
+    ///
+    /// * **Mechanism.** When a keyboard sends a lock-key press, the host toggles
+    ///   that lock's global state and pushes the new LED state back to every
+    ///   keyboard as an output report -- which `kbd::on_host_leds` records and
+    ///   `kbd::led_events` counts. Whether the host echoed, and what it echoed,
+    ///   is directly observable from the device.
+    ///
+    /// * **Heuristic.** What the echo *means* is inferred. No echo to a brief
+    ///   Caps Lock tap is macOS's tell: it does not toggle Caps Lock on a
+    ///   momentary HID tap the way Windows and Linux do. Among hosts that do
+    ///   echo, NumLock lit at enumeration leans Windows, which enables it by
+    ///   default; its absence leans Linux.
+    ///
+    /// So macOS is separated well and Windows/Linux only weakly, which is why
+    /// the result is documented to scripts as a hint and `OS_UNKNOWN` means
+    /// "could not tell" -- the same answer a host with no keyboard gives.
+    fn detect_os_impl(&mut self) -> Result<i32, Abort> {
+        if !claim_usb(self.tid) || !usb::kbd::is_ready() {
+            return Ok(pycon::host::OS_UNKNOWN);
+        }
+        self.kbd_active = true;
+
+        // The enumeration-time lock state, sampled before anything is perturbed.
+        let num_on_at_enum = usb::kbd::host_leds() & usb::kbd::LED_NUM != 0;
+
+        // Tap Caps Lock and watch for the host to echo a lock-LED report.
+        let before = usb::kbd::led_events();
+        self.kbd_key(CAPSLOCK_KEYCODE, true)?;
+        self.kbd_key(CAPSLOCK_KEYCODE, false)?;
+        let echoed = self.wait_led_change(before, OS_PROBE_MS)?;
+
+        // Put Caps Lock back the way it was found, so the probe leaves no trace
+        // on the user's session -- but only if it actually moved.
+        if echoed {
+            let restore_from = usb::kbd::led_events();
+            self.kbd_key(CAPSLOCK_KEYCODE, true)?;
+            self.kbd_key(CAPSLOCK_KEYCODE, false)?;
+            let _ = self.wait_led_change(restore_from, OS_PROBE_MS)?;
+        }
+
+        Ok(if !echoed {
+            pycon::host::OS_MAC
+        } else if num_on_at_enum {
+            pycon::host::OS_WINDOWS
+        } else {
+            pycon::host::OS_LINUX
+        })
+    }
+
+    /// Wait up to `timeout_ms` for the host's LED-report counter to move past
+    /// `since`, servicing USB throughout. Returns whether it moved.
+    fn wait_led_change(&mut self, since: u32, timeout_ms: u32) -> Result<bool, Abort> {
+        let start = platform::now_ms();
+        loop {
+            self.service()?;
+            if usb::kbd::led_events() != since {
+                return Ok(true);
+            }
+            if platform::elapsed(start, timeout_ms) {
+                return Ok(false);
+            }
+            sched::nap(OS_PROBE_STEP_MS);
+        }
     }
 
     /// One scheduling point: hand the CPU around, service USB, sample the keys,
@@ -428,6 +537,50 @@ impl Host for BadgeHost {
         Ok(true)
     }
 
+    fn kbd_ready(&mut self) -> bool {
+        usb::poll();
+        claim_usb(self.tid) && usb::kbd::is_ready()
+    }
+
+    fn kbd_key(&mut self, code: u8, down: bool) -> Result<bool, Abort> {
+        if !claim_usb(self.tid) {
+            return Ok(false);
+        }
+        // Edit the held-key set before sending, not after: if the report is
+        // dropped because nothing is listening, the script's idea of what is
+        // held should still be what it asked for, so the next report that does
+        // go out carries it -- the same rule the mouse buttons follow.
+        if down {
+            usb::kbd::key_down(code);
+        } else {
+            usb::kbd::key_up(code);
+        }
+        self.kbd_send()
+    }
+
+    fn kbd_modifiers(&mut self, mask: u8) -> Result<bool, Abort> {
+        if !claim_usb(self.tid) {
+            return Ok(false);
+        }
+        usb::kbd::set_modifiers(mask);
+        self.kbd_send()
+    }
+
+    fn kbd_release_all(&mut self) -> Result<bool, Abort> {
+        if !claim_usb(self.tid) {
+            return Ok(false);
+        }
+        usb::kbd::release_all();
+        self.kbd_send()
+    }
+
+    fn kbd_leds(&mut self) -> u32 {
+        usb::poll();
+        usb::kbd::host_leds() as u32
+    }
+
+    fn detect_os(&mut self) -> Result<i32, Abort> { self.detect_os_impl() }
+
     fn badgy_art(&mut self, frame: i32) -> Option<Vec<String>> {
         let art = badgy::frame_art(frame, badgy_tick())?;
         // Rendered back out as the same `#`/`.`/space rows a script would write
@@ -500,6 +653,22 @@ impl Drop for BadgeHost {
         // hit the exit chord would otherwise leave the home screen holding a
         // pose nothing is maintaining.
         mascot::release(self.tid);
+
+        // Let go of any keyboard keys the script was still holding, for the same
+        // reason as the mouse buttons: a script killed mid-chord would otherwise
+        // leave the host believing Ctrl (or any key) is still down, and nothing
+        // else would ever tell it otherwise. Best-effort -- if there is no host,
+        // there is nothing holding anything.
+        if self.kbd_active && usb::kbd::any_down() {
+            usb::kbd::release_all();
+            for _ in 0..MOUSE_WAIT_STEPS {
+                if !usb::kbd::is_ready() || usb::kbd::send() {
+                    break;
+                }
+                sched::nap(MOUSE_WAIT_STEP_MS);
+            }
+        }
+
         if self.buttons == 0 {
             return;
         }

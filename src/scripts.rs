@@ -243,13 +243,14 @@ impl Scripts {
     /// Lay down a blank volume with a couple of examples on it, so the drive
     /// explains itself the first time it is opened.
     fn format_fresh(&mut self) {
-        let seed: [(&str, &[u8]); 6] = [
+        let seed: [(&str, &[u8]); 7] = [
             ("readme.txt", README),
             ("hello.py", HELLO_PY),
             ("bounce.py", BOUNCE_PY),
             ("keys.py", KEYS_PY),
             ("jiggle.py", JIGGLE_PY),
             ("usbid.py", USBID_PY),
+            ("keyboard.py", KEYBOARD_PY),
         ];
         if let Err(e) = badgy_fat::format(msc::disk(), "BADGYOS", crate::usb::volume_id(), &seed) {
             crate::println!("scripts: format failed: {:?}", e);
@@ -270,3 +271,4 @@ const BOUNCE_PY: &[u8] = include_bytes!("../samples/bounce.py");
 const KEYS_PY: &[u8] = include_bytes!("../samples/keys.py");
 const JIGGLE_PY: &[u8] = include_bytes!("../samples/jiggle.py");
 const USBID_PY: &[u8] = include_bytes!("../samples/usbid.py");
+const KEYBOARD_PY: &[u8] = include_bytes!("../samples/keyboard.py");

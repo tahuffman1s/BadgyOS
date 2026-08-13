@@ -24,6 +24,7 @@
 //! not serviced immediately are simply NAKed and retried, which is normal USB.
 
 pub mod hid;
+pub mod kbd;
 pub mod msc;
 mod proto;
 
@@ -168,6 +169,7 @@ pub fn reattach() {
     }
     msc::CONFIGURED.store(false, core::sync::atomic::Ordering::SeqCst);
     hid::on_deconfigured();
+    kbd::on_deconfigured();
 
     let iox = Iox::new(utralib::utra::iox::HW_IOX_BASE as *mut u32);
     iox.set_gpio_pin_value(IoxPort::PF, 5, IoxValue::Low);

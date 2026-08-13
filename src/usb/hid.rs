@@ -122,10 +122,15 @@ pub const REPORT_DESC: [u8; 52] = [
 ///
 /// The driver carves `CRG_UDC_APP_BUFSIZE` (eight 512-byte slots) out of its
 /// IFRAM window and hands them out by endpoint. `msc.rs` uses the first four
-/// -- CBW, CSW, and a 1 KiB EP1 IN staging buffer -- so slot four is free, and
-/// it is the slot `get_app_buf_ptr` would assign to EP3 IN, an endpoint this
-/// firmware does not have. Using UDC memory rather than IFRAM1 keeps the report
-/// inside the window `ptr_in_udc_window` already vouches for.
+/// -- CBW, CSW, and a 1 KiB EP1 IN staging buffer -- so slot four is free.
+///
+/// It is nominally the slot `get_app_buf_ptr` computes for EP3 IN, which is the
+/// keyboard's endpoint (`kbd.rs`, using slot five) -- but nothing here calls
+/// `get_app_buf_ptr`: both HID reports are queued with an explicit address
+/// through `bulk_xfer`, so that assignment is never made and slots four and
+/// five belong to the mouse and keyboard alone. Using UDC memory rather than
+/// IFRAM1 keeps the report inside the window `ptr_in_udc_window` already
+/// vouches for.
 const REPORT_BUF_OFFSET: usize = CRG_UDC_APP_BUF_LEN * 4;
 
 const fn report_addr() -> usize {

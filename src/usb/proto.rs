@@ -13,23 +13,27 @@
 //!   storage is interface 2, so the reset silently stalls instead of recovering the endpoints;
 //! * `DISK_BUSY` is shared between the two functions.
 //!
-//! The layout here is two independent single-interface functions:
+//! The layout here is three independent single-interface functions:
 //!
 //! | iface | class | endpoints | what it is |
 //! |---|---|---|---|
 //! | 0 | 08/06/50 | `0x01` OUT, `0x81` IN (bulk) | the script drive, `msc.rs` |
 //! | 1 | 03/01/02 | `0x82` IN (interrupt) | the mouse, `hid.rs` |
+//! | 2 | 03/01/01 | `0x83` IN (interrupt) | the keyboard, `kbd.rs` |
 //!
 //! No interface association descriptor: an IAD groups several interfaces into
-//! one function, and neither of these spans more than one. Each keeps its own
-//! class requests, and the second one is routed by `wIndex` rather than shared
-//! -- which is the bug boot1 has.
+//! one function, and none of these spans more than one. Each keeps its own
+//! class requests, routed by `wIndex` rather than shared -- which is the bug
+//! boot1 has. The keyboard's lock LEDs are the one thing a host sends *down*,
+//! and it arrives as a SET_REPORT on this control pipe, caught in
+//! [`hid_kbd_class_request`] and [`handle_event`]'s EP0 OUT path.
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use bao1x_hal::usb::driver::*;
 
 use super::hid::{self, HID_INTERFACE};
+use super::kbd::{self, KBD_INTERFACE};
 use super::msc;
 
 // ---------------------------------------------------------------- identity
@@ -169,8 +173,8 @@ pub const EP_BULK_OUT: u8 = 0x01;
 pub const FS_BULK_MPS: usize = 64;
 pub const HS_BULK_MPS: usize = 512;
 
-/// How many interfaces the one configuration has.
-const NUM_INTERFACES: u8 = 2;
+/// How many interfaces the one configuration has: mass storage, mouse, keyboard.
+const NUM_INTERFACES: u8 = 3;
 
 /// Everything below is written into a byte buffer, so field order and the
 /// absence of padding are part of the wire format, not an optimization.
@@ -301,17 +305,20 @@ struct HidDescriptor {
 as_bytes!(HidDescriptor);
 
 impl HidDescriptor {
-    fn new() -> Self {
+    /// `report_desc_len` is the size of the interface's report descriptor -- the
+    /// mouse's and the keyboard's differ, so this cannot be a constant.
+    fn new(report_desc_len: u16) -> Self {
         Self {
             b_length: size_of::<Self>() as u8,
             b_descriptor_type: hid::USB_DT_HID,
             bcd_hid: 0x0111,
             // Not localized. This field is for keyboards with country-specific
-            // key legends; a mouse has none.
+            // key legends; neither interface claims one, so a host uses whatever
+            // layout the OS is set to -- which is why `type` maps US-ASCII.
             b_country_code: 0,
             b_num_descriptors: 1,
             b_report_descriptor_type: hid::USB_DT_HID_REPORT,
-            w_report_descriptor_length: hid::REPORT_DESC.len() as u16,
+            w_report_descriptor_length: report_desc_len,
         }
     }
 }
@@ -335,14 +342,12 @@ struct ExtCapDescriptor {
 as_bytes!(ExtCapDescriptor);
 
 /// Length of the configuration bundle: config, then mass storage with its two
-/// bulk endpoints, then HID with its class descriptor and one interrupt
-/// endpoint.
+/// bulk endpoints, then the mouse and the keyboard, each an interface with its
+/// HID class descriptor and one interrupt endpoint.
 const CONFIG_TOTAL_LEN: usize = size_of::<ConfigDescriptor>()
     + size_of::<InterfaceDescriptor>()
     + 2 * size_of::<EndpointDescriptor>()
-    + size_of::<InterfaceDescriptor>()
-    + size_of::<HidDescriptor>()
-    + size_of::<EndpointDescriptor>();
+    + 2 * (size_of::<InterfaceDescriptor>() + size_of::<HidDescriptor>() + size_of::<EndpointDescriptor>());
 
 /// Serialize the configuration bundle for one speed.
 ///
@@ -396,7 +401,7 @@ fn write_config(buf: &mut [u8], desc_type: u8, bulk_mps: u16, intr_interval: u8)
         b_interface_protocol: 0x02,  // mouse
         i_interface: 0,
     };
-    let hid_desc = HidDescriptor::new();
+    let hid_desc = HidDescriptor::new(hid::REPORT_DESC.len() as u16);
     let intr_ep = EndpointDescriptor {
         b_length: size_of::<EndpointDescriptor>() as u8,
         b_descriptor_type: USB_DT_ENDPOINT,
@@ -405,11 +410,31 @@ fn write_config(buf: &mut [u8], desc_type: u8, bulk_mps: u16, intr_interval: u8)
         w_max_packet_size: hid::INTR_MPS,
         b_interval: intr_interval,
     };
+    let kbd_interface = InterfaceDescriptor {
+        b_length: size_of::<InterfaceDescriptor>() as u8,
+        b_descriptor_type: USB_DT_INTERFACE,
+        b_interface_number: KBD_INTERFACE,
+        b_alternate_setting: 0,
+        b_num_endpoints: 1,
+        b_interface_class: 0x03,     // HID
+        b_interface_sub_class: 0x01, // boot interface
+        b_interface_protocol: 0x01,  // keyboard
+        i_interface: 0,
+    };
+    let kbd_desc = HidDescriptor::new(kbd::REPORT_DESC.len() as u16);
+    let kbd_intr_ep = EndpointDescriptor {
+        b_length: size_of::<EndpointDescriptor>() as u8,
+        b_descriptor_type: USB_DT_ENDPOINT,
+        b_endpoint_address: kbd::EP_INTR_IN,
+        bm_attributes: 0x03, // interrupt
+        w_max_packet_size: kbd::INTR_MPS,
+        b_interval: intr_interval,
+    };
 
     let ep_in = bulk_ep(EP_BULK_IN);
     let ep_out = bulk_ep(EP_BULK_OUT);
 
-    let parts: [&[u8]; 7] = [
+    let parts: [&[u8]; 10] = [
         config.as_ref(),
         msc_interface.as_ref(),
         ep_in.as_ref(),
@@ -417,6 +442,9 @@ fn write_config(buf: &mut [u8], desc_type: u8, bulk_mps: u16, intr_interval: u8)
         hid_interface.as_ref(),
         hid_desc.as_ref(),
         intr_ep.as_ref(),
+        kbd_interface.as_ref(),
+        kbd_desc.as_ref(),
+        kbd_intr_ep.as_ref(),
     ];
     let mut idx = 0;
     for p in parts {
@@ -547,7 +575,13 @@ fn get_descriptor(this: &mut CorigineUsb, value: u16, index: u16, length: usize)
         // aimed at the interface rather than the device, so `wIndex` selects
         // which interface is being asked. Mass storage has neither.
         hid::USB_DT_HID if index == HID_INTERFACE as u16 => {
-            let d = HidDescriptor::new();
+            let d = HidDescriptor::new(hid::REPORT_DESC.len() as u16);
+            let n = length.min(size_of::<HidDescriptor>());
+            buf[..n].copy_from_slice(&d.as_ref()[..n]);
+            n
+        }
+        hid::USB_DT_HID if index == KBD_INTERFACE as u16 => {
+            let d = HidDescriptor::new(kbd::REPORT_DESC.len() as u16);
             let n = length.min(size_of::<HidDescriptor>());
             buf[..n].copy_from_slice(&d.as_ref()[..n]);
             n
@@ -558,6 +592,13 @@ fn get_descriptor(this: &mut CorigineUsb, value: u16, index: u16, length: usize)
             // that enumerates and then does nothing.
             let n = length.min(hid::REPORT_DESC.len()).min(buf.len());
             buf[..n].copy_from_slice(&hid::REPORT_DESC[..n]);
+            n
+        }
+        hid::USB_DT_HID_REPORT if index == KBD_INTERFACE as u16 => {
+            // Same story for the keyboard: without this the interface binds and
+            // then no keystroke is ever understood.
+            let n = length.min(kbd::REPORT_DESC.len()).min(buf.len());
+            buf[..n].copy_from_slice(&kbd::REPORT_DESC[..n]);
             n
         }
         USB_DT_STRING => {
@@ -733,6 +774,91 @@ fn hid_class_request(this: &mut CorigineUsb, request: u8, w_value: u16, w_length
     }
 }
 
+/// Class requests aimed at the keyboard interface.
+///
+/// Two of these are load-bearing in a way the mouse's are not. GET_REPORT lets a
+/// host read the held keys without an interrupt transfer, as before -- but
+/// SET_REPORT is how the host pushes the lock LEDs *down*, and that is the whole
+/// substrate of the readback and the OS-detection trick. Because it carries a
+/// data stage, it is handled by staging an EP0 receive and letting
+/// [`handle_event`] copy the byte out when it lands.
+fn hid_kbd_class_request(this: &mut CorigineUsb, request: u8, w_value: u16, w_length: u16) {
+    match request {
+        hid::HID_REQ_GET_REPORT => {
+            let report_type = (w_value >> 8) as u8;
+            let report_id = (w_value & 0xff) as u8;
+            // Only the single unnumbered input report exists; an output report
+            // read (type 2) or any id but zero is not something to invent.
+            if report_type != 1 || report_id != 0 {
+                this.ep_halt(0, USB_RECV);
+                return;
+            }
+            let mut report = [0u8; kbd::REPORT_LEN];
+            let report_len = kbd::current_report(&mut report);
+            let n = (w_length as usize).min(report_len);
+            let Some(buf) = ep0_buf(this) else { return };
+            buf[..n].copy_from_slice(&report[..n]);
+            let addr = buf.as_ptr() as usize;
+            this.ep0_send(addr, n, 0);
+        }
+        hid::HID_REQ_SET_REPORT => {
+            // The host is pushing an output report down. wValue is
+            // (report type << 8) | report id; type 2 is an output report, which
+            // for a keyboard is the lock-LED byte. Anything else -- a feature
+            // report, a numbered report -- this interface does not define.
+            let report_type = (w_value >> 8) as u8;
+            if report_type != 2 || w_length == 0 {
+                this.ep_halt(0, USB_RECV);
+                return;
+            }
+            // Receive the LED byte into the EP0 staging buffer and mark that the
+            // next EP0 OUT completion is that data, so `handle_event` copies it
+            // into the readback state rather than ignoring it as it does every
+            // other control status stage. Only the first byte is meaningful, but
+            // the whole (short) report is accepted so the transfer completes.
+            let p = this.ep0_buf.load(Ordering::SeqCst) as usize;
+            let n = (w_length as usize).min(CRG_UDC_EP0_REQBUFSIZE);
+            kbd::arm_led_capture();
+            this.ep0_receive(p, n, 0);
+        }
+        hid::HID_REQ_GET_IDLE => {
+            if w_length != 1 {
+                this.ep_halt(0, USB_RECV);
+                return;
+            }
+            let idle = kbd::idle();
+            let Some(buf) = ep0_buf(this) else { return };
+            buf[0] = idle;
+            let addr = buf.as_ptr() as usize;
+            this.ep0_send(addr, 1, 0);
+        }
+        hid::HID_REQ_SET_IDLE => {
+            kbd::set_idle((w_value >> 8) as u8);
+            this.ep0_send(0, 0, 0);
+        }
+        hid::HID_REQ_GET_PROTOCOL => {
+            if w_length != 1 {
+                this.ep_halt(0, USB_RECV);
+                return;
+            }
+            let p = kbd::protocol();
+            let Some(buf) = ep0_buf(this) else { return };
+            buf[0] = p;
+            let addr = buf.as_ptr() as usize;
+            this.ep0_send(addr, 1, 0);
+        }
+        hid::HID_REQ_SET_PROTOCOL => {
+            if w_value > 1 {
+                this.ep_halt(0, USB_RECV);
+                return;
+            }
+            kbd::set_protocol(w_value as u8);
+            this.ep0_send(0, 0, 0);
+        }
+        _ => this.ep_halt(0, USB_RECV),
+    }
+}
+
 /// The driver's event callback. Everything USB that is not a bulk data
 /// completion arrives here.
 pub fn handle_event(this: &mut CorigineUsb, event_trb: &mut EventTrbS) -> CrgEvent {
@@ -787,6 +913,22 @@ pub fn handle_event(this: &mut CorigineUsb, event_trb: &mut EventTrbS) -> CrgEve
                     // from boot1, which notes the same thing: this is what
                     // actually causes the next control packet to move.
                     ret = if dir == USB_SEND { CrgEvent::Data(0, 1, 0) } else { CrgEvent::Data(1, 0, 0) };
+                }
+            } else if pei == 1 {
+                // EP0 OUT completions. The only one this firmware acts on is the
+                // data stage of a keyboard lock-LED SET_REPORT, which
+                // `hid_kbd_class_request` armed just before staging the receive.
+                // Every other EP0 OUT event -- the status stage of an IN control
+                // transfer, a SET_SEL payload -- means nothing here, so the
+                // armed flag is what separates them. Control transfers are
+                // serialized on EP0, so the first OUT completion after arming is
+                // that data and no other can slip in front of it.
+                if matches!(comp_code, CompletionCode::Success | CompletionCode::ShortPacket)
+                    && kbd::take_led_capture()
+                {
+                    if let Some(buf) = ep0_buf(this) {
+                        kbd::on_host_leds(buf[0]);
+                    }
                 }
             } else if pei >= 2 && matches!(comp_code, CompletionCode::Success | CompletionCode::ShortPacket) {
                 if let Some(f) = this.udc_ep[pei as usize].completion_handler {
@@ -848,12 +990,14 @@ pub fn handle_event(this: &mut CorigineUsb, event_trb: &mut EventTrbS) -> CrgEve
                             this.set_device_state(UsbDeviceState::Address);
                             msc::on_deconfigured();
                             hid::on_deconfigured();
+                            kbd::on_deconfigured();
                             this.ep0_send(0, 0, 0);
                         }
                         1 => {
                             this.set_device_state(UsbDeviceState::Configured);
                             msc::on_configured(this);
                             hid::on_configured(this);
+                            kbd::on_configured(this);
                             this.ep0_send(0, 0, 0);
                         }
                         _ => this.ep_halt(0, USB_RECV),
@@ -906,6 +1050,7 @@ pub fn handle_event(this: &mut CorigineUsb, event_trb: &mut EventTrbS) -> CrgEve
                         match (w_index & 0xff) as u8 {
                             MSC_INTERFACE => msc_class_request(this, req.b_request, w_value, w_length),
                             HID_INTERFACE => hid_class_request(this, req.b_request, w_value, w_length),
+                            KBD_INTERFACE => hid_kbd_class_request(this, req.b_request, w_value, w_length),
                             _ => this.ep_halt(0, USB_RECV),
                         }
                     }
