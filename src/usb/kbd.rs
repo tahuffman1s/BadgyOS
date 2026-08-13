@@ -215,10 +215,11 @@ static HOST_LEDS: AtomicU8 = AtomicU8::new(0);
 /// same bits" -- a toggle that ends where it started still bumps the count.
 static LED_EVENTS: AtomicU32 = AtomicU32::new(0);
 
-/// Set by the control handler the instant before it arms an EP0 OUT receive for
-/// a lock-LED SET_REPORT, and cleared when that data arrives. It gates the
-/// capture in `proto::handle_event` so an unrelated control transfer's status
-/// stage is never mistaken for LED data. See [`arm_led_capture`].
+/// Set by the control handler the instant before it stages the EP0 receive for
+/// a lock-LED SET_REPORT, and cleared on the next EP0 completion, which is when
+/// that data has landed. It gates the capture in `proto::handle_event` so an
+/// unrelated control transfer is never mistaken for LED data. See
+/// [`arm_led_capture`].
 static LED_CAPTURE: AtomicBool = AtomicBool::new(false);
 
 // ------------------------------------------------------------------ lifecycle
@@ -258,14 +259,15 @@ fn report_complete(_usb: &mut CorigineUsb, _addr: usize, _info: u32, _err: u8, _
 
 // ----------------------------------------------------------- host LED readback
 
-/// Arm capture of the next EP0 OUT data stage as a lock-LED report.
+/// Arm capture of the next EP0 completion as a lock-LED report.
 ///
-/// The control handler calls this immediately before staging the receive; the
-/// event handler consumes it with [`take_led_capture`] when the data lands.
+/// The control handler calls this immediately before staging the SET_REPORT
+/// receive; the event handler consumes it with [`take_led_capture`] on the next
+/// EP0 completion, by which point the data has been DMA'd into the EP0 buffer.
 pub fn arm_led_capture() { LED_CAPTURE.store(true, Ordering::SeqCst); }
 
-/// Was an LED capture armed? Clears the flag, so exactly one EP0 OUT completion
-/// is treated as LED data per SET_REPORT.
+/// Was an LED capture armed? Clears the flag, so exactly one EP0 completion is
+/// treated as LED data per SET_REPORT.
 pub fn take_led_capture() -> bool { LED_CAPTURE.swap(false, Ordering::SeqCst) }
 
 /// Record a lock-LED byte the host pushed down. Called from the event handler

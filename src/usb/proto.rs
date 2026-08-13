@@ -25,8 +25,9 @@
 //! one function, and none of these spans more than one. Each keeps its own
 //! class requests, routed by `wIndex` rather than shared -- which is the bug
 //! boot1 has. The keyboard's lock LEDs are the one thing a host sends *down*,
-//! and it arrives as a SET_REPORT on this control pipe, caught in
-//! [`hid_kbd_class_request`] and [`handle_event`]'s EP0 OUT path.
+//! and they arrive as a SET_REPORT on this control pipe, caught in
+//! [`hid_kbd_class_request`] and read out on the following EP0 completion in
+//! [`handle_event`].
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -908,27 +909,33 @@ pub fn handle_event(this: &mut CorigineUsb, event_trb: &mut EventTrbS) -> CrgEve
 
             let dir = (pei & 1) != 0;
             if pei == 0 {
+                // Every EP0 completion lands here: this controller reports both
+                // stages of a control transfer under endpoint id 0 and does not
+                // split EP0 by direction -- which is why the HAL's own
+                // `handle_event_inner` has no EP0-OUT case either, and why the
+                // keyboard's lock-LED capture has to happen here rather than
+                // under a would-be EP0-OUT index.
+                //
+                // `hid_kbd_class_request` arms the capture just before staging a
+                // SET_REPORT receive. The data stage DMAs the LED byte into the
+                // EP0 buffer, and the status stage that follows always raises a
+                // completion (its TRB sets interrupt-on-completion), so the very
+                // next EP0 event after arming is the one to read it on. Disarm on
+                // that first event whatever its completion code, so a failed
+                // SET_REPORT can never leave a later control transfer looking
+                // like LED data; only trust the byte when the transfer succeeded.
+                if kbd::take_led_capture() {
+                    if matches!(comp_code, CompletionCode::Success | CompletionCode::ShortPacket) {
+                        if let Some(buf) = ep0_buf(this) {
+                            kbd::on_host_leds(buf[0]);
+                        }
+                    }
+                }
                 if comp_code == CompletionCode::Success {
                     // The direction bits look inverted here. They are copied
                     // from boot1, which notes the same thing: this is what
                     // actually causes the next control packet to move.
                     ret = if dir == USB_SEND { CrgEvent::Data(0, 1, 0) } else { CrgEvent::Data(1, 0, 0) };
-                }
-            } else if pei == 1 {
-                // EP0 OUT completions. The only one this firmware acts on is the
-                // data stage of a keyboard lock-LED SET_REPORT, which
-                // `hid_kbd_class_request` armed just before staging the receive.
-                // Every other EP0 OUT event -- the status stage of an IN control
-                // transfer, a SET_SEL payload -- means nothing here, so the
-                // armed flag is what separates them. Control transfers are
-                // serialized on EP0, so the first OUT completion after arming is
-                // that data and no other can slip in front of it.
-                if matches!(comp_code, CompletionCode::Success | CompletionCode::ShortPacket)
-                    && kbd::take_led_capture()
-                {
-                    if let Some(buf) = ep0_buf(this) {
-                        kbd::on_host_leds(buf[0]);
-                    }
                 }
             } else if pei >= 2 && matches!(comp_code, CompletionCode::Success | CompletionCode::ShortPacket) {
                 if let Some(f) = this.udc_ep[pei as usize].completion_handler {
