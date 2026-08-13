@@ -92,6 +92,11 @@ pub fn attach(iox: &Iox) {
     iox.set_gpio_pin_value(se0_port, se0_pin, IoxValue::Low);
     delay(100);
 
+    // Whatever the last host asked for belongs to the last host. This is also
+    // the `reattach` path, so a badge that changes identity and comes back gets
+    // a clean fingerprint rather than the one the previous enumeration left.
+    proto::forget_host();
+
     // safety: called once, before anything else touches `USB`.
     let usb = unsafe {
         CorigineUsb::new(
@@ -184,6 +189,11 @@ pub fn is_configured() -> bool { msc::CONFIGURED.load(core::sync::atomic::Orderi
 
 /// The vendor and product id the device is currently presenting.
 pub fn ids() -> (u16, u16) { (proto::vendor_id(), proto::product_id()) }
+
+/// Did the host ask for the Microsoft OS string descriptor while enumerating?
+/// Only Windows does, which is what makes it worth remembering; the OS probe in
+/// `runner` is the only caller.
+pub fn ms_os_probed() -> bool { proto::ms_os_probed() }
 
 /// Change the vendor/product id the device presents, and re-enumerate so a host
 /// sees the new identity.

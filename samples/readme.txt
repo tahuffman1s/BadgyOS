@@ -57,9 +57,12 @@ took the report:
   kbd_leds()                the host's lock LEDs, a mask of LED_*
   detect_os()               guess the host OS, an OS_* value
 
-detect_os() plays the Caps Lock LED trick -- toggle a lock key and
-watch how the host echoes it back -- so it is a hint, not a fact:
-it reads macOS clearly and splits Windows from Linux only weakly.
+detect_os() is a hint, not a fact. macOS ignores a momentary Caps
+Lock tap where Windows and Linux echo it back, which reads clearly.
+Windows is told from Linux by a question only Windows asks while
+plugging in, so a PC that has already catalogued this badge stops
+asking and reads as Linux -- give usb_id() a pair that host has
+not seen and it asks again.
 kbd_leds() is the readback, the one thing a host tells a keyboard.
 A chord is one call: key_tap(key_of("r"), MOD_GUI) is Win+R, and
 key_tap(KEY_DELETE, MOD_CTRL | MOD_ALT) is Ctrl+Alt+Del. Keys the

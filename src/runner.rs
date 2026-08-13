@@ -221,34 +221,40 @@ impl BadgeHost {
         Ok(false)
     }
 
-    /// Best-effort OS fingerprint via the Caps Lock LED trick.
+    /// Best-effort OS fingerprint: the Caps Lock LED trick for macOS, and what
+    /// the host asked for while enumerating for Windows.
     ///
-    /// The mechanism is sound; the classification is a heuristic, and the two
+    /// The mechanisms are sound; the classification is a heuristic, and the two
     /// deserve to be told apart:
     ///
-    /// * **Mechanism.** When a keyboard sends a lock-key press, the host toggles
-    ///   that lock's global state and pushes the new LED state back to every
-    ///   keyboard as an output report -- which `kbd::on_host_leds` records and
-    ///   `kbd::led_events` counts. Whether the host echoed, and what it echoed,
-    ///   is directly observable from the device.
+    /// * **Mechanism.** When a keyboard sends a lock-key press, the host toggles that lock's global state and
+    ///   pushes the new LED state back to every keyboard as an output report -- which `kbd::on_host_leds`
+    ///   records and `kbd::led_events` counts. Separately, a host that asked for string descriptor 0xEE
+    ///   during enumeration is remembered by `proto`. Both are directly observable from the device.
     ///
-    /// * **Heuristic.** What the echo *means* is inferred. No echo to a brief
-    ///   Caps Lock tap is macOS's tell: it does not toggle Caps Lock on a
-    ///   momentary HID tap the way Windows and Linux do. Among hosts that do
-    ///   echo, NumLock lit at enumeration leans Windows, which enables it by
-    ///   default; its absence leans Linux.
+    /// * **Heuristic.** What they *mean* is inferred. No echo to a brief Caps Lock tap is macOS's tell: it
+    ///   does not toggle Caps Lock on a momentary HID tap the way Windows and Linux do. Among hosts that
+    ///   echo, asking for 0xEE -- the Microsoft OS string descriptor -- is Windows's tell, since no other
+    ///   host has a reason to request it.
     ///
-    /// So macOS is separated well and Windows/Linux only weakly, which is why
-    /// the result is documented to scripts as a hint and `OS_UNKNOWN` means
-    /// "could not tell" -- the same answer a host with no keyboard gives.
+    /// The 0xEE question replaces the NumLock-at-enumeration guess this used to
+    /// make. That guess was really "is NumLock on", not "which OS": Linux hosts
+    /// push their lock state down to a keyboard the moment it binds, so any
+    /// Linux desktop that keeps NumLock on -- most of them -- read as Windows.
+    ///
+    /// The one thing 0xEE gives up is the repeat visit. Windows caches the
+    /// answer per vendor/product/revision and does not ask twice, so a badge
+    /// replugged into a PC that has already catalogued it falls through to
+    /// `OS_LINUX`. `usb_id()` is the way out: a vendor/product pair that host
+    /// has not seen makes it ask again.
     fn detect_os_impl(&mut self) -> Result<i32, Abort> {
         if !claim_usb(self.tid) || !usb::kbd::is_ready() {
             return Ok(pycon::host::OS_UNKNOWN);
         }
         self.kbd_active = true;
 
-        // The enumeration-time lock state, sampled before anything is perturbed.
-        let num_on_at_enum = usb::kbd::host_leds() & usb::kbd::LED_NUM != 0;
+        // Sampled from this enumeration, before anything is perturbed.
+        let ms_os_probed = usb::ms_os_probed();
 
         // Tap Caps Lock and watch for the host to echo a lock-LED report.
         let before = usb::kbd::led_events();
@@ -267,7 +273,7 @@ impl BadgeHost {
 
         Ok(if !echoed {
             pycon::host::OS_MAC
-        } else if num_on_at_enum {
+        } else if ms_os_probed {
             pycon::host::OS_WINDOWS
         } else {
             pycon::host::OS_LINUX

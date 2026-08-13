@@ -93,13 +93,6 @@ const MOD_MAX: u8 = 0xE7;
 // The HID class request codes and descriptor-type numbers are the same for any
 // HID interface, so they are shared with the mouse rather than redeclared.
 
-// ------------------------------------------------------------------- LED bits
-
-/// Num Lock's bit in the host's lock-LED output report -- the one the OS probe
-/// reads to see whether the host enabled NumLock at enumeration. The full LED
-/// bit layout a script sees is documented at `pycon::host::LED_*`.
-pub const LED_NUM: u8 = 1 << 0;
-
 // --------------------------------------------------------- report descriptor
 
 /// An NKRO keyboard: eight modifier bits, a five-bit LED output report (so the
@@ -205,8 +198,9 @@ static PROTOCOL: AtomicU8 = AtomicU8::new(1);
 /// changes no behaviour here -- nothing resends a report on its own.
 static IDLE: AtomicU8 = AtomicU8::new(0);
 
-/// The lock LEDs the host last pushed down, as a bitmap of [`LED_NUM`] and
-/// friends. This is the readback: the only thing the host tells the keyboard.
+/// The lock LEDs the host last pushed down, as a bitmap laid out the way
+/// `pycon::host::LED_*` documents it to scripts. This is the readback: the only
+/// thing the host tells the keyboard.
 static HOST_LEDS: AtomicU8 = AtomicU8::new(0);
 
 /// How many LED output reports the host has sent since the interface was
@@ -277,7 +271,7 @@ pub fn on_host_leds(byte: u8) {
     LED_EVENTS.fetch_add(1, Ordering::SeqCst);
 }
 
-/// The lock LEDs the host last reported, as a bitmap of [`LED_NUM`] etc.
+/// The lock LEDs the host last reported, as a bitmap of `pycon::host::LED_*`.
 pub fn host_leds() -> u8 { HOST_LEDS.load(Ordering::SeqCst) }
 
 /// How many LED reports the host has sent since configuration. The OS probe
@@ -330,9 +324,7 @@ pub fn release_all() {
 }
 
 /// Is any key or modifier currently held?
-pub fn any_down() -> bool {
-    keys().modifiers != 0 || keys().bitmap.iter().any(|&b| b != 0)
-}
+pub fn any_down() -> bool { keys().modifiers != 0 || keys().bitmap.iter().any(|&b| b != 0) }
 
 // --------------------------------------------------------------------- sending
 

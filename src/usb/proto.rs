@@ -29,7 +29,7 @@
 //! [`hid_kbd_class_request`] and read out on the following EP0 completion in
 //! [`handle_event`].
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use bao1x_hal::usb::driver::*;
 
@@ -83,6 +83,25 @@ pub fn set_identity(vid: u16, pid: u16) -> bool {
     IDENTITY.store(((vid as u32) << 16) | pid as u32, Ordering::SeqCst);
     true
 }
+
+/// The string descriptor index Microsoft reserved for its OS descriptor. A
+/// Windows host asks a device it has not catalogued for this one string; Linux
+/// and macOS have no reason to and never do. Nothing here answers it -- see the
+/// stall in [`get_descriptor`] -- but the asking itself is worth remembering,
+/// because it is the only positive "this host is Windows" signal the device gets
+/// for free (see `runner::detect_os_impl`).
+const MS_OS_STRING_INDEX: u8 = 0xEE;
+
+/// Whether the current host asked for [`MS_OS_STRING_INDEX`].
+static MS_OS_PROBED: AtomicBool = AtomicBool::new(false);
+
+/// Did this host ask for the Microsoft OS string descriptor?
+pub fn ms_os_probed() -> bool { MS_OS_PROBED.load(Ordering::SeqCst) }
+
+/// Forget what the last host asked for. Called from [`super::attach`], so a
+/// badge moved from a Windows machine to a Linux one -- or replugged after
+/// `usb_id()` -- does not carry the old host's fingerprint across.
+pub fn forget_host() { MS_OS_PROBED.store(false, Ordering::SeqCst); }
 
 /// Longest product string a script can set. A USB string descriptor tops out at
 /// 126 UTF-16 units; this is well under that and keeps the buffer small enough
@@ -623,6 +642,13 @@ fn get_descriptor(this: &mut CorigineUsb, value: u16, index: u16, length: usize)
                         // the serial number, as boot1 does, means an OS probing
                         // for a Microsoft OS descriptor at index 0xEE gets a
                         // valid-looking string it will then try to interpret.
+                        //
+                        // Still stalled, but noted on the way out: only Windows
+                        // asks for that index, so the question is more useful
+                        // than any answer would have been.
+                        if id == MS_OS_STRING_INDEX {
+                            MS_OS_PROBED.store(true, Ordering::SeqCst);
+                        }
                         this.ep_halt(0, USB_RECV);
                         return;
                     }

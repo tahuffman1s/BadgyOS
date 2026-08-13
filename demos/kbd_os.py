@@ -1,9 +1,11 @@
-# Test: OS detection with the Caps Lock LED trick.
+# Test: OS detection, by Caps Lock and by what the host asked for.
 #
-# detect_os() taps Caps Lock, watches how -- and how fast -- the host echoes
-# the lock LEDs back, and guesses from that. The mechanism is exact; the guess
-# is a heuristic: it reads macOS clearly and tells Windows from Linux only
-# weakly, so treat the answer as a hint. It puts Caps Lock back the way it
+# detect_os() taps Caps Lock and watches whether the host echoes the lock LEDs
+# back -- macOS does not, Windows and Linux do -- then splits Windows from Linux
+# by a descriptor only Windows asks for while the badge is plugging in. The
+# mechanisms are exact; the reading is a heuristic, so treat it as a hint. A PC
+# that has seen this badge before skips that question and reads as Linux; a
+# fresh usb_id() makes it ask again. The probe puts Caps Lock back the way it
 # found it, so your session is left alone.
 #
 # Press CENTER to probe again. Hold LEFT and CENTER to quit.
